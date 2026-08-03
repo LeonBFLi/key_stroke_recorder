@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pynput import keyboard
+from pynput import keyboard, mouse
 
-from app import KeyEvent, decode_key, encode_key, load_events, parse_click_rate, parse_hotkey, save_events
+from app import KeyEvent, decode_key, encode_key, format_hotkey, load_events, parse_click_rate, parse_hotkey, save_events
 
 
 class StorageTests(unittest.TestCase):
@@ -44,6 +44,14 @@ class StorageTests(unittest.TestCase):
         for value in ("", "<f8>", "<not-a-key>"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_hotkey(value)
+
+    def test_captured_hotkey_formatting(self):
+        # The dummy backend aliases several special keys, so compare against
+        # the backend's own key name rather than assuming its Windows value.
+        self.assertEqual(format_hotkey(frozenset({keyboard.Key.f6})), keyboard.Key.f6.name.upper())
+        self.assertEqual(format_hotkey(frozenset({mouse.Button.right})), "鼠标右键")
+        label = format_hotkey(frozenset({keyboard.Key.ctrl, keyboard.KeyCode.from_char("c")}))
+        self.assertEqual(set(label.split(" + ")), {keyboard.Key.ctrl.name.upper(), "C"})
 
 
 if __name__ == "__main__":
