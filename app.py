@@ -10,11 +10,13 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from pynput import keyboard
+from pynput import keyboard, mouse
 
 
 APP_NAME = "键盘录制与回放工具"
 FILE_VERSION = 1
+MIN_CLICK_RATE = 0.5
+MAX_CLICK_RATE = 100.0
 
 
 @dataclass
@@ -28,6 +30,11 @@ class KeyEvent:
 def encode_key(key: keyboard.Key | keyboard.KeyCode) -> tuple[str, str | int | None]:
     if isinstance(key, keyboard.Key):
         return "special", key.name
+    # A listener event normally includes the virtual-key code. Prefer it over
+    # the translated character so playback reproduces the physical key (and
+    # lets separately recorded Shift/Ctrl/Alt state determine the result).
+    if key.vk is not None:
+        return "vk", key.vk
     if key.char is not None:
         return "char", key.char
     return "vk", key.vk
@@ -63,6 +70,30 @@ def load_events(path: Path) -> list[KeyEvent]:
     return events
 
 
+def parse_click_rate(value: str) -> float:
+    """Validate clicks per second separately from the Tk user interface."""
+    try:
+        rate = float(value)
+    except ValueError as exc:
+        raise ValueError("连点频率必须是数字") from exc
+    if not MIN_CLICK_RATE <= rate <= MAX_CLICK_RATE:
+        raise ValueError(f"连点频率必须在 {MIN_CLICK_RATE:g} 到 {MAX_CLICK_RATE:g} 次/秒之间")
+    return rate
+
+
+def parse_hotkey(value: str) -> frozenset[keyboard.Key | keyboard.KeyCode]:
+    """Parse pynput's portable hotkey syntax and reserve F8 for emergency stop."""
+    try:
+        keys = frozenset(keyboard.HotKey.parse(value.strip().lower()))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("热键格式无效，例如：<f6> 或 <ctrl>+<alt>+c") from exc
+    if not keys:
+        raise ValueError("热键不能为空")
+    if keyboard.Key.f8 in keys:
+        raise ValueError("F8 是紧急停止键，请选择其他热键")
+    return keys
+
+
 class MacroApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -72,16 +103,22 @@ class MacroApp:
         self.playing = False
         self.record_listener: keyboard.Listener | None = None
         self.last_event_at = 0.0
+        self.capture_lock = threading.Lock()
         self.stop_playback = threading.Event()
+        self.clicking = False
+        self.stop_clicking = threading.Event()
+        self.click_hotkey = parse_hotkey("<f6>")
+        self.hotkey_pressed: set[keyboard.Key | keyboard.KeyCode] = set()
+        self.hotkey_armed = True
 
         root.title(APP_NAME)
-        root.geometry("650x430")
-        root.minsize(590, 390)
+        root.geometry("700x590")
+        root.minsize(640, 540)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._build_ui()
 
         # F8 is an emergency stop even while another program has focus.
-        self.hotkey_listener = keyboard.Listener(on_press=self._global_key_press)
+        self.hotkey_listener = keyboard.Listener(on_press=self._global_key_press, on_release=self._global_key_release)
         self.hotkey_listener.daemon = True
         self.hotkey_listener.start()
 
@@ -90,7 +127,7 @@ class MacroApp:
         outer.pack(fill="both", expand=True)
 
         ttk.Label(outer, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="录制时可切换到任意窗口；F8 可随时停止录制或回放。", foreground="#555").pack(anchor="w", pady=(4, 18))
+        ttk.Label(outer, text="录制时可切换到任意窗口；F8 可随时停止所有任务。", foreground="#555").pack(anchor="w", pady=(4, 18))
 
         record_box = ttk.LabelFrame(outer, text="1. 录制", padding=12)
         record_box.pack(fill="x")
@@ -117,6 +154,21 @@ class MacroApp:
         self.play_button.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(16, 0))
         play_box.columnconfigure(1, weight=1)
 
+        click_box = ttk.LabelFrame(outer, text="3. 鼠标连点", padding=12)
+        click_box.pack(fill="x", pady=(0, 14))
+        ttk.Label(click_box, text="频率（次/秒）：").grid(row=0, column=0, sticky="e")
+        self.click_rate_var = tk.StringVar(value="10")
+        ttk.Spinbox(click_box, from_=MIN_CLICK_RATE, to=MAX_CLICK_RATE, increment=0.5, width=8,
+                    textvariable=self.click_rate_var).grid(row=0, column=1, sticky="w")
+        ttk.Label(click_box, text="开关热键：").grid(row=0, column=2, sticky="e", padx=(18, 0))
+        self.click_hotkey_var = tk.StringVar(value="<f6>")
+        ttk.Entry(click_box, width=18, textvariable=self.click_hotkey_var).grid(row=0, column=3, sticky="w")
+        ttk.Label(click_box, text="格式示例：<f6>、<ctrl>+<alt>+c", foreground="#666").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.click_button = ttk.Button(click_box, text="开始连点", command=self.toggle_clicking)
+        self.click_button.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        click_box.columnconfigure(3, weight=1)
+
         status_box = ttk.LabelFrame(outer, text="状态", padding=12)
         status_box.pack(fill="both", expand=True)
         self.status = tk.StringVar(value="就绪")
@@ -130,6 +182,18 @@ class MacroApp:
     def _global_key_press(self, key: keyboard.Key | keyboard.KeyCode) -> None:
         if key == keyboard.Key.f8:
             self.root.after(0, self.stop_all)
+            return
+        canonical = self.hotkey_listener.canonical(key)
+        self.hotkey_pressed.add(canonical)
+        if self.hotkey_armed and self.click_hotkey.issubset(self.hotkey_pressed):
+            self.hotkey_armed = False
+            self.root.after(0, self.toggle_clicking)
+
+    def _global_key_release(self, key: keyboard.Key | keyboard.KeyCode) -> None:
+        canonical = self.hotkey_listener.canonical(key)
+        self.hotkey_pressed.discard(canonical)
+        if not self.click_hotkey.issubset(self.hotkey_pressed):
+            self.hotkey_armed = True
 
     def toggle_recording(self) -> None:
         if self.recording:
@@ -150,21 +214,26 @@ class MacroApp:
         self.progress.start(12)
 
     def _capture(self, action: str, key: keyboard.Key | keyboard.KeyCode) -> None:
-        if not self.recording:
-            return
         # F8 belongs to the application itself and must never become part of a macro.
         if key == keyboard.Key.f8:
             return
-        now = time.perf_counter()
-        key_type, value = encode_key(key)
-        self.events.append(KeyEvent(now - self.last_event_at, action, key_type, value))
-        self.last_event_at = now
-        self.root.after(0, lambda: self.event_label.configure(text=f"已记录 {len(self.events)} 个事件"))
+        # Both listener callbacks can arrive nearly simultaneously.  Serialize the
+        # timestamp and append operation so chords retain their true event order.
+        with self.capture_lock:
+            if not self.recording:
+                return
+            now = time.perf_counter()
+            key_type, value = encode_key(key)
+            self.events.append(KeyEvent(now - self.last_event_at, action, key_type, value))
+            self.last_event_at = now
+            event_count = len(self.events)
+        self.root.after(0, lambda n=event_count: self.event_label.configure(text=f"已记录 {n} 个事件"))
 
     def stop_recording(self) -> None:
-        if not self.recording:
-            return
-        self.recording = False
+        with self.capture_lock:
+            if not self.recording:
+                return
+            self.recording = False
         if self.record_listener:
             self.record_listener.stop()
             self.record_listener = None
@@ -233,8 +302,15 @@ class MacroApp:
         try:
             while not self.stop_playback.is_set() and (loops is None or completed < loops):
                 self.root.after(0, lambda n=completed + 1: self.status.set(f"正在运行第 {n} 次…按 F8 可停止。"))
+                # Schedule against one monotonic origin instead of sleeping after
+                # every injection. This prevents OS/controller overhead from
+                # accumulating and keeps close-together chord events aligned.
+                started_at = time.perf_counter()
+                target_offset = 0.0
                 for event in self.events:
-                    if self.stop_playback.wait(event.delay):
+                    target_offset += event.delay
+                    remaining = started_at + target_offset - time.perf_counter()
+                    if remaining > 0 and self.stop_playback.wait(remaining):
                         break
                     key = decode_key(event)
                     if event.action == "press":
@@ -258,6 +334,52 @@ class MacroApp:
                     pass
         self.root.after(0, lambda: self._play_finished(completed, error))
 
+    def toggle_clicking(self) -> None:
+        if self.clicking:
+            self.stop_clicking.set()
+            return
+        try:
+            rate = parse_click_rate(self.click_rate_var.get())
+            hotkey = parse_hotkey(self.click_hotkey_var.get())
+        except ValueError as exc:
+            messagebox.showwarning("连点设置无效", str(exc))
+            return
+        self.click_hotkey = hotkey
+        self.hotkey_pressed.clear()
+        self.hotkey_armed = False  # re-arm after the currently held hotkey is released
+        self.clicking = True
+        self.stop_clicking.clear()
+        self.click_button.configure(text="停止连点")
+        self.status.set(f"正在以 {rate:g} 次/秒连点；按设置的热键或 F8 停止。")
+        threading.Thread(target=self._click_worker, args=(rate,), daemon=True).start()
+
+    def _click_worker(self, rate: float) -> None:
+        controller = mouse.Controller()
+        interval = 1.0 / rate
+        next_click = time.perf_counter()
+        error: Exception | None = None
+        try:
+            while not self.stop_clicking.is_set():
+                controller.click(mouse.Button.left)
+                next_click += interval
+                wait = next_click - time.perf_counter()
+                if wait > 0 and self.stop_clicking.wait(wait):
+                    break
+                if wait <= -interval:
+                    next_click = time.perf_counter()
+        except Exception as exc:
+            error = exc
+        self.root.after(0, lambda: self._click_finished(error))
+
+    def _click_finished(self, error: Exception | None) -> None:
+        self.clicking = False
+        self.click_button.configure(text="开始连点")
+        if error:
+            messagebox.showerror("连点失败", str(error))
+            self.status.set("连点失败。")
+        else:
+            self.status.set("鼠标连点已停止。")
+
     def _play_finished(self, completed: int, error: Exception | None) -> None:
         self.playing = False
         self.progress.stop()
@@ -274,6 +396,8 @@ class MacroApp:
             self.stop_recording()
         if self.playing:
             self.stop_playback.set()
+        if self.clicking:
+            self.stop_clicking.set()
 
     def close(self) -> None:
         self.stop_all()
