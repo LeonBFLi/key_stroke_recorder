@@ -17,6 +17,7 @@ APP_NAME = "键盘录制与回放工具"
 FILE_VERSION = 1
 MIN_CLICK_RATE = 0.5
 MAX_CLICK_RATE = 100.0
+HotkeyInput = keyboard.Key | keyboard.KeyCode | mouse.Button
 
 
 @dataclass
@@ -94,6 +95,23 @@ def parse_hotkey(value: str) -> frozenset[keyboard.Key | keyboard.KeyCode]:
     return keys
 
 
+def format_hotkey(keys: frozenset[HotkeyInput]) -> str:
+    """Return a readable label for a hotkey captured from input devices."""
+    labels: list[str] = []
+    for key in sorted(keys, key=str):
+        if isinstance(key, keyboard.Key):
+            labels.append(key.name.upper())
+        elif isinstance(key, mouse.Button):
+            labels.append({
+                mouse.Button.left: "鼠标左键",
+                mouse.Button.middle: "鼠标中键",
+                mouse.Button.right: "鼠标右键",
+            }.get(key, str(key).removeprefix("Button.")))
+        else:
+            labels.append(key.char.upper() if key.char else f"VK {key.vk}")
+    return " + ".join(labels)
+
+
 class MacroApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -107,9 +125,12 @@ class MacroApp:
         self.stop_playback = threading.Event()
         self.clicking = False
         self.stop_clicking = threading.Event()
-        self.click_hotkey = parse_hotkey("<f6>")
-        self.hotkey_pressed: set[keyboard.Key | keyboard.KeyCode] = set()
+        self.click_hotkey: frozenset[HotkeyInput] = frozenset({keyboard.Key.f6})
+        self.hotkey_pressed: set[HotkeyInput] = set()
         self.hotkey_armed = True
+        self.capturing_hotkey = False
+        self.hotkey_capture_started = False
+        self.hotkey_capture_keys: set[HotkeyInput] = set()
 
         root.title(APP_NAME)
         root.geometry("700x590")
@@ -121,6 +142,11 @@ class MacroApp:
         self.hotkey_listener = keyboard.Listener(on_press=self._global_key_press, on_release=self._global_key_release)
         self.hotkey_listener.daemon = True
         self.hotkey_listener.start()
+        self.mouse_hotkey_listener = mouse.Listener(
+            on_click=self._global_mouse_click,
+        )
+        self.mouse_hotkey_listener.daemon = True
+        self.mouse_hotkey_listener.start()
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=18)
@@ -161,12 +187,15 @@ class MacroApp:
         ttk.Spinbox(click_box, from_=MIN_CLICK_RATE, to=MAX_CLICK_RATE, increment=0.5, width=8,
                     textvariable=self.click_rate_var).grid(row=0, column=1, sticky="w")
         ttk.Label(click_box, text="开关热键：").grid(row=0, column=2, sticky="e", padx=(18, 0))
-        self.click_hotkey_var = tk.StringVar(value="<f6>")
-        ttk.Entry(click_box, width=18, textvariable=self.click_hotkey_var).grid(row=0, column=3, sticky="w")
-        ttk.Label(click_box, text="格式示例：<f6>、<ctrl>+<alt>+c", foreground="#666").grid(
-            row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.click_hotkey_var = tk.StringVar(value=format_hotkey(self.click_hotkey))
+        ttk.Label(click_box, width=18, textvariable=self.click_hotkey_var, relief="sunken", padding=(5, 3)).grid(
+            row=0, column=3, sticky="ew")
+        self.capture_hotkey_button = ttk.Button(click_box, text="设置热键", command=self.start_hotkey_capture)
+        self.capture_hotkey_button.grid(row=0, column=4, padx=(8, 0))
+        ttk.Label(click_box, text="点击“设置热键”后，按下键盘按键、组合键或鼠标键", foreground="#666").grid(
+            row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
         self.click_button = ttk.Button(click_box, text="开始连点", command=self.toggle_clicking)
-        self.click_button.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.click_button.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(10, 0))
         click_box.columnconfigure(3, weight=1)
 
         status_box = ttk.LabelFrame(outer, text="状态", padding=12)
@@ -176,14 +205,70 @@ class MacroApp:
         self.progress = ttk.Progressbar(status_box, mode="indeterminate")
         self.progress.pack(fill="x", pady=(12, 0))
 
+    def start_hotkey_capture(self) -> None:
+        """Arm global listeners to learn the next complete keyboard/mouse chord."""
+        if self.clicking:
+            messagebox.showwarning("无法设置热键", "请先停止鼠标连点。")
+            return
+        self.capturing_hotkey = True
+        self.hotkey_capture_started = False
+        self.hotkey_capture_keys.clear()
+        self.hotkey_pressed.clear()
+        self.capture_hotkey_button.configure(state="disabled")
+        self.click_button.configure(state="disabled")
+        self.click_hotkey_var.set("等待按下热键…")
+        self.status.set("请按下要使用的键盘按键、组合键或鼠标键；松开后即完成设置。")
+
+    def _capture_hotkey_press(self, key: HotkeyInput) -> None:
+        if key == keyboard.Key.f8:
+            self.root.after(0, lambda: self._finish_hotkey_capture(None, "F8 是紧急停止键，请选择其他热键。"))
+            return
+        if key == mouse.Button.left:
+            self.root.after(0, lambda: self._finish_hotkey_capture(None, "鼠标左键用于执行连点，请选择其他鼠标键。"))
+            return
+        self.hotkey_capture_started = True
+        self.hotkey_capture_keys.add(key)
+        self.hotkey_pressed.add(key)
+
+    def _capture_hotkey_release(self, key: HotkeyInput) -> None:
+        self.hotkey_pressed.discard(key)
+        if self.hotkey_capture_started and not self.hotkey_pressed:
+            captured = frozenset(self.hotkey_capture_keys)
+            self.root.after(0, lambda: self._finish_hotkey_capture(captured))
+
+    def _finish_hotkey_capture(self, keys: frozenset[HotkeyInput] | None, error: str | None = None) -> None:
+        if not self.capturing_hotkey:
+            return
+        self.capturing_hotkey = False
+        self.hotkey_capture_started = False
+        self.hotkey_capture_keys.clear()
+        self.hotkey_pressed.clear()
+        self.capture_hotkey_button.configure(state="normal")
+        self.click_button.configure(state="normal")
+        if keys:
+            self.click_hotkey = keys
+            self.click_hotkey_var.set(format_hotkey(keys))
+            self.status.set(f"鼠标连点热键已设置为：{format_hotkey(keys)}。")
+        else:
+            self.click_hotkey_var.set(format_hotkey(self.click_hotkey))
+            if error:
+                messagebox.showwarning("热键不可用", error)
+                self.status.set("热键未更改。")
+
     def _mode_changed(self) -> None:
         self.count_spin.configure(state="normal" if self.loop_mode.get() == "count" else "disabled")
 
     def _global_key_press(self, key: keyboard.Key | keyboard.KeyCode) -> None:
         if key == keyboard.Key.f8:
+            if self.capturing_hotkey:
+                self._capture_hotkey_press(key)
+                return
             self.root.after(0, self.stop_all)
             return
         canonical = self.hotkey_listener.canonical(key)
+        if self.capturing_hotkey:
+            self._capture_hotkey_press(canonical)
+            return
         self.hotkey_pressed.add(canonical)
         if self.hotkey_armed and self.click_hotkey.issubset(self.hotkey_pressed):
             self.hotkey_armed = False
@@ -191,9 +276,29 @@ class MacroApp:
 
     def _global_key_release(self, key: keyboard.Key | keyboard.KeyCode) -> None:
         canonical = self.hotkey_listener.canonical(key)
+        if self.capturing_hotkey:
+            self._capture_hotkey_release(canonical)
+            return
         self.hotkey_pressed.discard(canonical)
         if not self.click_hotkey.issubset(self.hotkey_pressed):
             self.hotkey_armed = True
+
+    def _global_mouse_click(self, _x: int, _y: int, button: mouse.Button, pressed: bool) -> None:
+        if self.capturing_hotkey:
+            if pressed:
+                self._capture_hotkey_press(button)
+            else:
+                self._capture_hotkey_release(button)
+            return
+        if pressed:
+            self.hotkey_pressed.add(button)
+            if self.hotkey_armed and self.click_hotkey.issubset(self.hotkey_pressed):
+                self.hotkey_armed = False
+                self.root.after(0, self.toggle_clicking)
+        else:
+            self.hotkey_pressed.discard(button)
+            if not self.click_hotkey.issubset(self.hotkey_pressed):
+                self.hotkey_armed = True
 
     def toggle_recording(self) -> None:
         if self.recording:
@@ -340,11 +445,9 @@ class MacroApp:
             return
         try:
             rate = parse_click_rate(self.click_rate_var.get())
-            hotkey = parse_hotkey(self.click_hotkey_var.get())
         except ValueError as exc:
             messagebox.showwarning("连点设置无效", str(exc))
             return
-        self.click_hotkey = hotkey
         self.hotkey_pressed.clear()
         self.hotkey_armed = False  # re-arm after the currently held hotkey is released
         self.clicking = True
@@ -402,6 +505,7 @@ class MacroApp:
     def close(self) -> None:
         self.stop_all()
         self.hotkey_listener.stop()
+        self.mouse_hotkey_listener.stop()
         self.root.destroy()
 
 
