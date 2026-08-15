@@ -5,8 +5,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pynput import keyboard, mouse
+from app import (KeyEvent, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
+                 load_events, parse_click_rate, parse_hotkey, save_events)
 
-from app import KeyEvent, decode_key, encode_key, format_hotkey, load_events, parse_click_rate, parse_hotkey, save_events
+
+class FakeImage:
+    def __init__(self, width, height, pixels):
+        self.size = (width, height)
+        self._pixels = pixels
+
+    def convert(self, _mode):
+        return self
+
+    def getdata(self):
+        return self._pixels
 
 
 class StorageTests(unittest.TestCase):
@@ -52,6 +64,17 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(format_hotkey(frozenset({mouse.Button.right})), "鼠标右键")
         label = format_hotkey(frozenset({keyboard.Key.ctrl, keyboard.KeyCode.from_char("c")}))
         self.assertEqual(set(label.split(" + ")), {keyboard.Key.ctrl.name.upper(), "C"})
+
+    def test_red_blob_detection_ignores_isolated_pixels(self):
+        pixels = [(255, 255, 255)] * 400
+        pixels[21] = (255, 0, 0)
+        image = FakeImage(20, 20, pixels)
+        self.assertEqual(count_red_blob_pixels(image, 215, 95, 95, 95, 160, 4, 55), 0)
+
+        for y in range(5, 9):
+            for x in range(5, 9):
+                pixels[y * 20 + x] = (255, 0, 0)
+        self.assertEqual(count_red_blob_pixels(image, 215, 95, 95, 95, 160, 4, 55), 16)
 
 
 if __name__ == "__main__":

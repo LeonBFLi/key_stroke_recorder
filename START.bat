@@ -16,14 +16,14 @@ if not defined PY_CMD (
     exit /b 1
 )
 
-echo 正在启动 Win10 红点监控自动最小化工具...
-%PY_CMD% win10_red_monitor_sleep.py
+echo 正在启动键盘录制、回放与红点监控工具...
+%PY_CMD% app.py
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
     echo.
     echo [提示] 程序异常退出，退出码：%EXIT_CODE%
-    echo 你可以先执行：pip install pillow
+    echo 你可以先执行：pip install -r requirements.txt
     echo.
     pause
 )
