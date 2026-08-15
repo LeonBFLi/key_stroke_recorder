@@ -5,15 +5,22 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from pynput import keyboard, mouse
 
+try:
+    from PIL import ImageGrab
+except ImportError:  # pragma: no cover - shown as a friendly UI error at runtime
+    ImageGrab = None
 
-APP_NAME = "键盘录制与回放工具"
+
+APP_NAME = "键盘录制、回放与红点监控工具"
 FILE_VERSION = 1
 MIN_CLICK_RATE = 0.5
 MAX_CLICK_RATE = 100.0
@@ -26,6 +33,22 @@ class KeyEvent:
     action: str
     key_type: str
     value: str | int | None
+
+
+@dataclass(frozen=True)
+class Region:
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
 
 
 def encode_key(key: keyboard.Key | keyboard.KeyCode) -> tuple[str, str | int | None]:
@@ -133,8 +156,8 @@ class MacroApp:
         self.hotkey_capture_keys: set[HotkeyInput] = set()
 
         root.title(APP_NAME)
-        root.geometry("700x590")
-        root.minsize(640, 540)
+        root.geometry("780x720")
+        root.minsize(700, 620)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._build_ui()
 
@@ -149,8 +172,13 @@ class MacroApp:
         self.mouse_hotkey_listener.start()
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        outer = ttk.Frame(notebook, padding=18)
+        monitor_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(outer, text="键盘录制与回放")
+        notebook.add(monitor_tab, text="红点监控")
+        self.red_monitor = RedMonitorPanel(monitor_tab)
 
         ttk.Label(outer, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
         ttk.Label(outer, text="录制时可切换到任意窗口；F8 可随时停止所有任务。", foreground="#555").pack(anchor="w", pady=(4, 18))
@@ -501,6 +529,7 @@ class MacroApp:
             self.stop_playback.set()
         if self.clicking:
             self.stop_clicking.set()
+        self.red_monitor.stop(silent=True)
 
     def close(self) -> None:
         self.stop_all()
@@ -509,7 +538,276 @@ class MacroApp:
         self.root.destroy()
 
 
+class RegionSelector(tk.Toplevel):
+    """Transparent full-screen overlay used to choose the monitored area."""
+
+    def __init__(self, master: tk.Misc, callback) -> None:
+        super().__init__(master)
+        self.callback = callback
+        self.start_x = self.start_y = 0
+        self.start_root_x = self.start_root_y = 0
+        self.rectangle: int | None = None
+        self.attributes("-fullscreen", True)
+        self.attributes("-alpha", 0.25)
+        self.attributes("-topmost", True)
+        self.configure(bg="black")
+        self.canvas = tk.Canvas(self, cursor="cross", bg="gray20", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _press(self, event: tk.Event) -> None:
+        self.start_x, self.start_y = event.x, event.y
+        self.start_root_x, self.start_root_y = event.x_root, event.y_root
+        if self.rectangle is not None:
+            self.canvas.delete(self.rectangle)
+        self.rectangle = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="red", width=2)
+
+    def _drag(self, event: tk.Event) -> None:
+        if self.rectangle is not None:
+            self.canvas.coords(self.rectangle, self.start_x, self.start_y, event.x, event.y)
+
+    def _release(self, event: tk.Event) -> None:
+        region = Region(
+            min(self.start_root_x, event.x_root), min(self.start_root_y, event.y_root),
+            max(self.start_root_x, event.x_root), max(self.start_root_y, event.y_root),
+        )
+        if region.width < 5 or region.height < 5:
+            messagebox.showwarning("区域太小", "请至少选择 5×5 像素的区域。", parent=self)
+            return
+        self.callback(region)
+        self.destroy()
+
+
+def count_red_blob_pixels(image, red_threshold: int, delta_threshold: int, green_max: int,
+                          blue_max: int, min_saturation: int, min_blob_pixels: int,
+                          min_blob_density: int) -> int:
+    """Count pixels belonging to sufficiently large, dense red components."""
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    candidates: list[bool] = []
+    for red, green, blue in rgb.getdata():
+        maximum, minimum = max(red, green, blue), min(red, green, blue)
+        saturation = int((maximum - minimum) / maximum * 255) if maximum else 0
+        candidates.append(red >= red_threshold and green <= green_max and blue <= blue_max
+                          and red - green >= delta_threshold and red - blue >= delta_threshold
+                          and saturation >= min_saturation)
+
+    visited = [False] * len(candidates)
+    valid_count = 0
+    for start, candidate in enumerate(candidates):
+        if not candidate or visited[start]:
+            continue
+        queue = deque([start])
+        visited[start] = True
+        component: list[tuple[int, int]] = []
+        while queue:
+            current = queue.popleft()
+            y, x = divmod(current, width)
+            component.append((x, y))
+            for dx, dy in ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0),
+                           (-1, 1), (0, 1), (1, 1)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    index = ny * width + nx
+                    if candidates[index] and not visited[index]:
+                        visited[index] = True
+                        queue.append(index)
+        xs, ys = zip(*component)
+        area = (max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1)
+        if len(component) >= min_blob_pixels and len(component) / area >= min_blob_density / 100:
+            valid_count += len(component)
+    return valid_count
+
+
+class RedMonitorPanel:
+    """Red-dot monitor embedded in the application's second tab."""
+
+    def __init__(self, parent: ttk.Frame) -> None:
+        self.parent = parent
+        self.root = parent.winfo_toplevel()
+        self.region: Region | None = None
+        self.stop_event = threading.Event()
+        self.worker: threading.Thread | None = None
+        self.running = False
+        self.settings = {
+            "red_threshold": tk.IntVar(value=215), "delta_threshold": tk.IntVar(value=95),
+            "green_max": tk.IntVar(value=95), "blue_max": tk.IntVar(value=95),
+            "min_saturation": tk.IntVar(value=160), "min_blob_pixels": tk.IntVar(value=14),
+            "min_blob_density": tk.IntVar(value=55), "min_red_pixels": tk.IntVar(value=18),
+            "check_interval": tk.IntVar(value=120), "close_delay": tk.DoubleVar(value=10),
+        }
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        ttk.Label(self.parent, text="红点监控", font=("Microsoft YaHei UI", 16, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(self.parent, text="发现红点时立即提示；持续存在到设定时间后关闭当时的前台窗口。",
+                  foreground="#555").grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 14))
+        ttk.Button(self.parent, text="选择监控区域", command=self.select_region).grid(row=2, column=0, sticky="w")
+        self.region_label = ttk.Label(self.parent, text="尚未选择区域")
+        self.region_label.grid(row=2, column=1, columnspan=3, sticky="w", padx=8)
+
+        fields = [
+            ("红色阈值 (R ≥)", "red_threshold"), ("红色优势 (R-G/B ≥)", "delta_threshold"),
+            ("绿色上限", "green_max"), ("蓝色上限", "blue_max"),
+            ("最小饱和度 (0–255)", "min_saturation"), ("最少红像素", "min_red_pixels"),
+            ("最小红团像素", "min_blob_pixels"), ("最小红团密度 (%)", "min_blob_density"),
+            ("检测间隔 (ms)", "check_interval"), ("持续 N 秒后关闭窗口", "close_delay"),
+        ]
+        for index, (label, key) in enumerate(fields):
+            row, pair = 3 + index // 2, index % 2
+            column = pair * 2
+            ttk.Label(self.parent, text=label).grid(row=row, column=column, sticky="w", pady=7)
+            ttk.Entry(self.parent, textvariable=self.settings[key], width=10).grid(row=row, column=column + 1, sticky="w")
+
+        buttons = ttk.Frame(self.parent)
+        buttons.grid(row=8, column=0, columnspan=4, sticky="w", pady=12)
+        self.start_button = ttk.Button(buttons, text="开始监控", command=self.start)
+        self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(buttons, text="停止监控", command=self.stop, state="disabled")
+        self.stop_button.pack(side="left", padx=8)
+        self.status = tk.StringVar(value="状态：待机")
+        ttk.Label(self.parent, textvariable=self.status).grid(row=9, column=0, columnspan=4, sticky="w")
+        log_frame = ttk.LabelFrame(self.parent, text="运行日志", padding=6)
+        log_frame.grid(row=10, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
+        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+        for column in range(4):
+            self.parent.columnconfigure(column, weight=1)
+        self.parent.rowconfigure(10, weight=1)
+
+    def select_region(self) -> None:
+        RegionSelector(self.root, self._region_selected)
+
+    def _region_selected(self, region: Region) -> None:
+        self.region = region
+        text = f"({region.left}, {region.top})–({region.right}, {region.bottom})，{region.width}×{region.height}"
+        self.region_label.configure(text=text)
+        self._log(f"已选择监控区域：{text}")
+
+    def _validated_settings(self) -> dict[str, float | int]:
+        values = {key: variable.get() for key, variable in self.settings.items()}
+        byte_fields = ("red_threshold", "green_max", "blue_max", "min_saturation")
+        if any(not 0 <= values[key] <= 255 for key in byte_fields):
+            raise ValueError("颜色阈值必须在 0 到 255 之间。")
+        if values["delta_threshold"] < 0 or values["min_blob_pixels"] < 1 or values["min_red_pixels"] < 1:
+            raise ValueError("像素数量必须至少为 1，红色优势不能小于 0。")
+        if not 1 <= values["min_blob_density"] <= 100:
+            raise ValueError("红团密度必须在 1% 到 100% 之间。")
+        if values["check_interval"] < 20 or values["close_delay"] < 0:
+            raise ValueError("检测间隔至少为 20 ms，关闭等待时间不能小于 0 秒。")
+        return values
+
+    def start(self) -> None:
+        if self.running:
+            return
+        if self.region is None:
+            messagebox.showwarning("提示", "请先选择监控区域。")
+            return
+        if ImageGrab is None:
+            messagebox.showerror("缺少依赖", "红点监控需要 Pillow，请重新运行 run.bat 安装依赖。")
+            return
+        try:
+            settings = self._validated_settings()
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showwarning("监控设置无效", str(exc))
+            return
+        self.running = True
+        self.stop_event.clear()
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.status.set("状态：监控中")
+        self._log("开始监控")
+        self.worker = threading.Thread(target=self._monitor, args=(self.region, settings), daemon=True)
+        self.worker.start()
+
+    def stop(self, silent: bool = False) -> None:
+        if not self.running:
+            return
+        self.running = False
+        self.stop_event.set()
+        self.start_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.status.set("状态：已停止")
+        if not silent:
+            self._log("停止监控")
+
+    def _monitor(self, region: Region, settings: dict[str, float | int]) -> None:
+        detected_at: float | None = None
+        action_done = False
+        try:
+            while not self.stop_event.is_set():
+                image = ImageGrab.grab(bbox=(region.left, region.top, region.right, region.bottom))
+                red_count = count_red_blob_pixels(
+                    image, *(int(settings[key]) for key in ("red_threshold", "delta_threshold", "green_max",
+                           "blue_max", "min_saturation", "min_blob_pixels", "min_blob_density")))
+                now = time.monotonic()
+                has_red = red_count >= int(settings["min_red_pixels"])
+                if has_red and detected_at is None:
+                    detected_at = now
+                    action_done = False
+                    self.root.after(0, lambda count=red_count: self._first_detected(count))
+                elif not has_red and detected_at is not None:
+                    detected_at = None
+                    action_done = False
+                    self.root.after(0, self._red_disappeared)
+                if has_red and detected_at is not None and not action_done:
+                    remaining = float(settings["close_delay"]) - (now - detected_at)
+                    if remaining <= 0:
+                        action_done = True
+                        self.root.after(0, self._close_foreground_window)
+                    else:
+                        self.root.after(0, lambda seconds=remaining: self.status.set(
+                            f"状态：检测到红点，若持续存在将在 {seconds:.1f} 秒后关闭当前窗口"))
+                self.stop_event.wait(int(settings["check_interval"]) / 1000)
+        except Exception as exc:
+            self.root.after(0, lambda error=exc: self._monitor_failed(error))
+
+    def _first_detected(self, count: int) -> None:
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except (ImportError, RuntimeError):  # pragma: no cover - Windows normally supplies winsound
+            self.root.bell()
+        self._log(f"检测到红点（{count} 像素），已播放提示音并开始倒计时")
+
+    def _red_disappeared(self) -> None:
+        self.status.set("状态：红点已消失，继续监控")
+        self._log("红点在倒计时结束前消失，已取消关闭窗口")
+
+    def _close_foreground_window(self) -> None:
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if not hwnd:
+                raise RuntimeError("未找到前台窗口")
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            self.status.set("状态：红点持续存在，已发送关闭当前窗口指令")
+            self._log("红点倒计时结束后仍存在，已关闭当前窗口")
+        except Exception as exc:  # pragma: no cover - depends on the Windows desktop
+            self._log(f"关闭当前窗口失败：{exc}")
+
+    def _monitor_failed(self, error: Exception) -> None:
+        self.stop()
+        messagebox.showerror("红点监控失败", str(error))
+        self._log(f"监控失败：{error}")
+
+    def _log(self, message: str) -> None:
+        line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n"
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+
 def main() -> None:
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (ImportError, AttributeError):  # pragma: no cover - only available on Windows
+        pass
     root = tk.Tk()
     try:
         root.iconname(APP_NAME)
