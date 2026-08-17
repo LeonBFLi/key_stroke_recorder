@@ -1,4 +1,4 @@
-"""Windows keyboard macro recorder with a small Tkinter user interface."""
+"""Windows keyboard and mouse macro recorder with a small Tkinter UI."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ except ImportError:  # pragma: no cover - shown as a friendly UI error at runtim
     ImageGrab = None
 
 
-APP_NAME = "键盘录制、回放与红点监控工具"
-FILE_VERSION = 1
+APP_NAME = "键盘鼠标录制、回放与红点监控工具"
+FILE_VERSION = 2
 MIN_CLICK_RATE = 0.5
 MAX_CLICK_RATE = 100.0
 HotkeyInput = keyboard.Key | keyboard.KeyCode | mouse.Button
@@ -33,6 +33,18 @@ class KeyEvent:
     action: str
     key_type: str
     value: str | int | None
+
+
+@dataclass
+class MouseEvent:
+    delay: float
+    action: str
+    x: int
+    y: int
+    button: str | None = None
+
+
+MacroEvent = KeyEvent | MouseEvent
 
 
 @dataclass(frozen=True)
@@ -77,20 +89,44 @@ def decode_key(event: KeyEvent) -> keyboard.Key | keyboard.KeyCode:
     raise ValueError(f"未知按键类型: {event.key_type}")
 
 
-def save_events(path: Path, events: list[KeyEvent]) -> None:
-    payload = {"version": FILE_VERSION, "events": [asdict(item) for item in events]}
+def save_events(path: Path, events: list[MacroEvent]) -> None:
+    serialized = []
+    for item in events:
+        data = asdict(item)
+        data["device"] = "keyboard" if isinstance(item, KeyEvent) else "mouse"
+        serialized.append(data)
+    payload = {"version": FILE_VERSION, "events": serialized}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def load_events(path: Path) -> list[KeyEvent]:
+def load_events(path: Path) -> list[MacroEvent]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("version") != FILE_VERSION or not isinstance(payload.get("events"), list):
-        raise ValueError("不是受支持的按键录制文件")
-    events = [KeyEvent(**item) for item in payload["events"]]
-    for item in events:
-        if item.action not in {"press", "release"} or item.delay < 0:
+    version = payload.get("version")
+    if version not in {1, FILE_VERSION} or not isinstance(payload.get("events"), list):
+        raise ValueError("不是受支持的键盘鼠标录制文件")
+    events: list[MacroEvent] = []
+    for data in payload["events"]:
+        if not isinstance(data, dict):
             raise ValueError("录制文件中包含无效事件")
-        decode_key(item)
+        item = dict(data)
+        device = item.pop("device", "keyboard" if version == 1 else None)
+        if device == "keyboard":
+            events.append(KeyEvent(**item))
+        elif device == "mouse":
+            events.append(MouseEvent(**item))
+        else:
+            raise ValueError("录制文件中包含未知设备事件")
+    for item in events:
+        if item.delay < 0:
+            raise ValueError("录制文件中包含无效事件")
+        if isinstance(item, KeyEvent):
+            if item.action not in {"press", "release"}:
+                raise ValueError("录制文件中包含无效键盘事件")
+            decode_key(item)
+        elif (item.action not in {"move", "press", "release"}
+              or (item.action == "move" and item.button is not None)
+              or (item.action != "move" and item.button not in {"left", "middle", "right"})):
+            raise ValueError("录制文件中包含无效鼠标事件")
     return events
 
 
@@ -138,11 +174,12 @@ def format_hotkey(keys: frozenset[HotkeyInput]) -> str:
 class MacroApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.events: list[KeyEvent] = []
+        self.events: list[MacroEvent] = []
         self.file_path: Path | None = None
         self.recording = False
         self.playing = False
         self.record_listener: keyboard.Listener | None = None
+        self.mouse_record_listener: mouse.Listener | None = None
         self.last_event_at = 0.0
         self.capture_lock = threading.Lock()
         self.stop_playback = threading.Event()
@@ -176,7 +213,7 @@ class MacroApp:
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
         outer = ttk.Frame(notebook, padding=18)
         monitor_tab = ttk.Frame(notebook, padding=12)
-        notebook.add(outer, text="键盘录制与回放")
+        notebook.add(outer, text="键盘鼠标录制与回放")
         notebook.add(monitor_tab, text="红点监控")
         self.red_monitor = RedMonitorPanel(monitor_tab)
 
@@ -343,7 +380,10 @@ class MacroApp:
         self.record_button.configure(text="停止录制")
         self.save_button.configure(state="disabled")
         self.play_button.configure(state="disabled")
-        self.status.set("正在录制…请切换到目标窗口操作。完成后点击“停止录制”或按 F8。")
+        self.mouse_record_listener = mouse.Listener(on_move=self._capture_mouse_move,
+                                                    on_click=self._capture_mouse_click)
+        self.mouse_record_listener.start()
+        self.status.set("正在录制键盘、鼠标移动和点击…完成后点击“停止录制”或按 F8。")
         self.progress.start(12)
 
     def _capture(self, action: str, key: keyboard.Key | keyboard.KeyCode) -> None:
@@ -362,6 +402,28 @@ class MacroApp:
             event_count = len(self.events)
         self.root.after(0, lambda n=event_count: self.event_label.configure(text=f"已记录 {n} 个事件"))
 
+    def _capture_mouse_move(self, x: int, y: int) -> None:
+        self._append_mouse_event("move", x, y)
+
+    def _capture_mouse_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
+        button_name = {
+            mouse.Button.left: "left",
+            mouse.Button.middle: "middle",
+            mouse.Button.right: "right",
+        }.get(button)
+        if button_name is not None:
+            self._append_mouse_event("press" if pressed else "release", x, y, button_name)
+
+    def _append_mouse_event(self, action: str, x: int, y: int, button: str | None = None) -> None:
+        with self.capture_lock:
+            if not self.recording:
+                return
+            now = time.perf_counter()
+            self.events.append(MouseEvent(now - self.last_event_at, action, int(x), int(y), button))
+            self.last_event_at = now
+            event_count = len(self.events)
+        self.root.after(0, lambda n=event_count: self.event_label.configure(text=f"已记录 {n} 个事件"))
+
     def stop_recording(self) -> None:
         with self.capture_lock:
             if not self.recording:
@@ -370,16 +432,19 @@ class MacroApp:
         if self.record_listener:
             self.record_listener.stop()
             self.record_listener = None
+        if self.mouse_record_listener:
+            self.mouse_record_listener.stop()
+            self.mouse_record_listener = None
         self.record_button.configure(text="开始录制")
         self.save_button.configure(state="normal" if self.events else "disabled")
         self.play_button.configure(state="normal" if self.events else "disabled")
         self.progress.stop()
-        self.status.set(f"录制完成，共 {len(self.events)} 个按键事件。请保存录制。")
+        self.status.set(f"录制完成，共 {len(self.events)} 个键盘和鼠标事件。请保存录制。")
 
     def save(self) -> None:
         if not self.events:
             return
-        chosen = filedialog.asksaveasfilename(title="保存按键录制", defaultextension=".ksr.json", filetypes=[("按键录制", "*.ksr.json"), ("JSON", "*.json")])
+        chosen = filedialog.asksaveasfilename(title="保存键盘鼠标录制", defaultextension=".ksr.json", filetypes=[("键盘鼠标录制", "*.ksr.json"), ("JSON", "*.json")])
         if not chosen:
             return
         try:
@@ -391,7 +456,7 @@ class MacroApp:
             messagebox.showerror("保存失败", str(exc))
 
     def open_file(self) -> None:
-        chosen = filedialog.askopenfilename(title="选择按键录制", filetypes=[("按键录制", "*.ksr.json"), ("JSON", "*.json"), ("所有文件", "*.*")])
+        chosen = filedialog.askopenfilename(title="选择键盘鼠标录制", filetypes=[("键盘鼠标录制", "*.ksr.json"), ("JSON", "*.json"), ("所有文件", "*.*")])
         if not chosen:
             return
         try:
@@ -428,10 +493,12 @@ class MacroApp:
         threading.Thread(target=self._play_worker, args=(None if forever else count,), daemon=True).start()
 
     def _play_worker(self, loops: int | None) -> None:
-        controller = keyboard.Controller()
+        key_controller = keyboard.Controller()
+        mouse_controller = mouse.Controller()
         completed = 0
         error: Exception | None = None
         pressed: set[keyboard.Key | keyboard.KeyCode] = set()
+        pressed_buttons: set[mouse.Button] = set()
         try:
             while not self.stop_playback.is_set() and (loops is None or completed < loops):
                 self.root.after(0, lambda n=completed + 1: self.status.set(f"正在运行第 {n} 次…按 F8 可停止。"))
@@ -445,13 +512,25 @@ class MacroApp:
                     remaining = started_at + target_offset - time.perf_counter()
                     if remaining > 0 and self.stop_playback.wait(remaining):
                         break
-                    key = decode_key(event)
-                    if event.action == "press":
-                        controller.press(key)
-                        pressed.add(key)
+                    if isinstance(event, MouseEvent):
+                        mouse_controller.position = (event.x, event.y)
+                        if event.action == "move":
+                            continue
+                        button = mouse.Button[event.button]  # type: ignore[index]
+                        if event.action == "press":
+                            mouse_controller.press(button)
+                            pressed_buttons.add(button)
+                        else:
+                            mouse_controller.release(button)
+                            pressed_buttons.discard(button)
                     else:
-                        controller.release(key)
-                        pressed.discard(key)
+                        key = decode_key(event)
+                        if event.action == "press":
+                            key_controller.press(key)
+                            pressed.add(key)
+                        else:
+                            key_controller.release(key)
+                            pressed.discard(key)
                 else:
                     completed += 1
                     continue
@@ -462,7 +541,12 @@ class MacroApp:
             # Stopping halfway through a shortcut must not leave Ctrl/Alt/etc. held down.
             for key in pressed:
                 try:
-                    controller.release(key)
+                    key_controller.release(key)
+                except Exception:
+                    pass
+            for button in pressed_buttons:
+                try:
+                    mouse_controller.release(button)
                 except Exception:
                     pass
         self.root.after(0, lambda: self._play_finished(completed, error))
