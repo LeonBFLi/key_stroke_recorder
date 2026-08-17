@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pynput import keyboard, mouse
-from app import (KeyEvent, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
+from app import (KeyEvent, MouseEvent, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
                  load_events, parse_click_rate, parse_hotkey, save_events)
 
 
@@ -29,11 +29,37 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(decoded, key)
 
     def test_file_round_trip(self):
-        expected = [KeyEvent(0.25, "press", "char", "a"), KeyEvent(0.1, "release", "char", "a")]
+        expected = [
+            KeyEvent(0.25, "press", "char", "a"),
+            MouseEvent(0.02, "move", 320, 240),
+            MouseEvent(0.1, "press", 320, 240, "left"),
+            MouseEvent(0.05, "release", 320, 240, "left"),
+            KeyEvent(0.1, "release", "char", "a"),
+        ]
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "macro.ksr.json"
             save_events(path, expected)
             self.assertEqual(load_events(path), expected)
+
+    def test_loads_version_one_keyboard_recording(self):
+        payload = {"version": 1, "events": [
+            {"delay": 0.2, "action": "press", "key_type": "char", "value": "a"},
+        ]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "old.ksr.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(load_events(path), [KeyEvent(0.2, "press", "char", "a")])
+
+    def test_rejects_invalid_mouse_event(self):
+        payload = {"version": 2, "events": [
+            {"device": "mouse", "delay": 0, "action": "press", "x": 1, "y": 2,
+             "button": "unknown"},
+        ]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bad-mouse.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_events(path)
 
     def test_rejects_invalid_action(self):
         with tempfile.TemporaryDirectory() as folder:
