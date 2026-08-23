@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pynput import keyboard, mouse
-from app import (KeyEvent, MouseEvent, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
+from app import (KeyEvent, MouseEvent, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
                  load_events, parse_click_rate, parse_hotkey, save_events)
 
 
@@ -101,6 +101,26 @@ class StorageTests(unittest.TestCase):
             for x in range(5, 9):
                 pixels[y * 20 + x] = (255, 0, 0)
         self.assertEqual(count_red_blob_pixels(image, 215, 95, 95, 95, 160, 4, 55), 16)
+
+    def test_sensitive_defaults_detect_small_antialiased_red_dot(self):
+        pixels = [(40, 80, 100)] * 100
+        for index, color in zip((44, 45, 54, 55, 56, 65),
+                                ((205, 82, 76), (220, 70, 70), (195, 90, 85),
+                                 (235, 80, 75), (190, 95, 90), (210, 85, 80))):
+            pixels[index] = color
+        image = FakeImage(10, 10, pixels)
+        self.assertEqual(count_red_blob_pixels(image, 180, 55, 165, 165, 85, 5, 30), 6)
+
+    def test_red_presence_filter_tolerates_brief_misses_and_movement(self):
+        tracker = RedPresenceFilter(detect_confirmations=2, missing_confirmations=3)
+        self.assertEqual(tracker.update(True), (False, False))
+        self.assertEqual(tracker.update(True), (True, True))
+        # A moving dot can be missed for a frame while screenshots are sampled.
+        self.assertEqual(tracker.update(False), (True, False))
+        self.assertEqual(tracker.update(True), (True, False))
+        self.assertEqual(tracker.update(False), (True, False))
+        self.assertEqual(tracker.update(False), (True, False))
+        self.assertEqual(tracker.update(False), (False, True))
 
 
 if __name__ == "__main__":

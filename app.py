@@ -24,6 +24,8 @@ APP_NAME = "键盘鼠标录制、回放与红点监控工具"
 FILE_VERSION = 2
 MIN_CLICK_RATE = 0.5
 MAX_CLICK_RATE = 100.0
+RED_DETECT_CONFIRMATIONS = 2
+RED_MISSING_CONFIRMATIONS = 5
 HotkeyInput = keyboard.Key | keyboard.KeyCode | mouse.Button
 
 
@@ -61,6 +63,32 @@ class Region:
     @property
     def height(self) -> int:
         return self.bottom - self.top
+
+
+@dataclass
+class RedPresenceFilter:
+    """Debounce noisy screenshots without assuming that the dot stays still."""
+
+    detect_confirmations: int = RED_DETECT_CONFIRMATIONS
+    missing_confirmations: int = RED_MISSING_CONFIRMATIONS
+    present: bool = False
+    positive_frames: int = 0
+    missing_frames: int = 0
+
+    def update(self, detected: bool) -> tuple[bool, bool]:
+        """Return the stable state and whether that state changed this frame."""
+        previous = self.present
+        if detected:
+            self.positive_frames += 1
+            self.missing_frames = 0
+            if self.positive_frames >= self.detect_confirmations:
+                self.present = True
+        else:
+            self.positive_frames = 0
+            self.missing_frames += 1
+            if self.missing_frames >= self.missing_confirmations:
+                self.present = False
+        return self.present, self.present != previous
 
 
 def encode_key(key: keyboard.Key | keyboard.KeyCode) -> tuple[str, str | int | None]:
@@ -218,7 +246,7 @@ class MacroApp:
         self.red_monitor = RedMonitorPanel(monitor_tab)
 
         ttk.Label(outer, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="录制时可切换到任意窗口；F8 可随时停止所有任务。", foreground="#555").pack(anchor="w", pady=(4, 18))
+        ttk.Label(outer, text="空闲时按 F8 可开始录制；运行时按 F8 可随时停止所有任务。", foreground="#555").pack(anchor="w", pady=(4, 18))
 
         record_box = ttk.LabelFrame(outer, text="1. 录制", padding=12)
         record_box.pack(fill="x")
@@ -328,7 +356,13 @@ class MacroApp:
             if self.capturing_hotkey:
                 self._capture_hotkey_press(key)
                 return
-            self.root.after(0, self.stop_all)
+            # F8 doubles as a convenient recording toggle: when absolutely
+            # nothing is running it starts recording; otherwise it retains its
+            # existing emergency-stop behaviour for every feature.
+            if not (self.recording or self.playing or self.clicking or self.red_monitor.running):
+                self.root.after(0, self.toggle_recording)
+            else:
+                self.root.after(0, self.stop_all)
             return
         canonical = self.hotkey_listener.canonical(key)
         if self.capturing_hotkey:
@@ -717,10 +751,13 @@ class RedMonitorPanel:
         self.worker: threading.Thread | None = None
         self.running = False
         self.settings = {
-            "red_threshold": tk.IntVar(value=215), "delta_threshold": tk.IntVar(value=95),
-            "green_max": tk.IntVar(value=95), "blue_max": tk.IntVar(value=95),
-            "min_saturation": tk.IntVar(value=160), "min_blob_pixels": tk.IntVar(value=14),
-            "min_blob_density": tk.IntVar(value=55), "min_red_pixels": tk.IntVar(value=18),
+            # Include dim/anti-aliased edge pixels commonly found in small UI
+            # notification dots. Component and temporal filtering below still
+            # reject isolated red noise.
+            "red_threshold": tk.IntVar(value=180), "delta_threshold": tk.IntVar(value=55),
+            "green_max": tk.IntVar(value=165), "blue_max": tk.IntVar(value=165),
+            "min_saturation": tk.IntVar(value=85), "min_blob_pixels": tk.IntVar(value=5),
+            "min_blob_density": tk.IntVar(value=30), "min_red_pixels": tk.IntVar(value=5),
             "check_interval": tk.IntVar(value=120), "close_delay": tk.DoubleVar(value=10),
         }
         self._build_ui()
@@ -821,6 +858,7 @@ class RedMonitorPanel:
     def _monitor(self, region: Region, settings: dict[str, float | int]) -> None:
         detected_at: float | None = None
         action_done = False
+        presence = RedPresenceFilter()
         try:
             while not self.stop_event.is_set():
                 image = ImageGrab.grab(bbox=(region.left, region.top, region.right, region.bottom))
@@ -828,12 +866,12 @@ class RedMonitorPanel:
                     image, *(int(settings[key]) for key in ("red_threshold", "delta_threshold", "green_max",
                            "blue_max", "min_saturation", "min_blob_pixels", "min_blob_density")))
                 now = time.monotonic()
-                has_red = red_count >= int(settings["min_red_pixels"])
-                if has_red and detected_at is None:
+                has_red, changed = presence.update(red_count >= int(settings["min_red_pixels"]))
+                if has_red and changed:
                     detected_at = now
                     action_done = False
                     self.root.after(0, lambda count=red_count: self._first_detected(count))
-                elif not has_red and detected_at is not None:
+                elif not has_red and changed:
                     detected_at = None
                     action_done = False
                     self.root.after(0, self._red_disappeared)
