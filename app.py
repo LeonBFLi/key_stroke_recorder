@@ -226,7 +226,8 @@ class MacroApp:
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._build_ui()
 
-        # F8 is an emergency stop even while another program has focus.
+        # F8 starts playback while idle and remains an emergency stop while a
+        # task is running, even when another program has focus.
         self.hotkey_listener = keyboard.Listener(on_press=self._global_key_press, on_release=self._global_key_release)
         self.hotkey_listener.daemon = True
         self.hotkey_listener.start()
@@ -246,7 +247,7 @@ class MacroApp:
         self.red_monitor = RedMonitorPanel(monitor_tab)
 
         ttk.Label(outer, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="空闲时按 F8 可开始录制；运行时按 F8 可随时停止所有任务。", foreground="#555").pack(anchor="w", pady=(4, 18))
+        ttk.Label(outer, text="空闲时按 F8 可运行已加载的录制；运行时按 F8 可随时停止所有任务。", foreground="#555").pack(anchor="w", pady=(4, 18))
 
         record_box = ttk.LabelFrame(outer, text="1. 录制", padding=12)
         record_box.pack(fill="x")
@@ -356,11 +357,11 @@ class MacroApp:
             if self.capturing_hotkey:
                 self._capture_hotkey_press(key)
                 return
-            # F8 doubles as a convenient recording toggle: when absolutely
-            # nothing is running it starts recording; otherwise it retains its
-            # existing emergency-stop behaviour for every feature.
+            # F8 runs the currently loaded/captured macro while idle. It is not
+            # tied to starting a recording; while a task is active it retains
+            # its emergency-stop behaviour for every feature.
             if not (self.recording or self.playing or self.clicking or self.red_monitor.running):
-                self.root.after(0, self.toggle_recording)
+                self.root.after(0, self.toggle_playback)
             else:
                 self.root.after(0, self.stop_all)
             return
