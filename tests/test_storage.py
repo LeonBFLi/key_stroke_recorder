@@ -2,10 +2,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pynput import keyboard, mouse
-from app import (KeyEvent, MouseEvent, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
+from app import (KeyEvent, MacroApp, MouseEvent, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
                  load_events, parse_click_rate, parse_hotkey, save_events)
 
 
@@ -22,6 +22,33 @@ class FakeImage:
 
 
 class StorageTests(unittest.TestCase):
+    def test_f8_starts_playback_instead_of_recording_when_idle(self):
+        app = MacroApp.__new__(MacroApp)
+        app.capturing_hotkey = False
+        app.recording = app.playing = app.clicking = False
+        app.red_monitor = Mock(running=False)
+        app.root = Mock()
+        app.toggle_playback = Mock()
+        app.toggle_recording = Mock()
+
+        app._global_key_press(keyboard.Key.f8)
+
+        app.root.after.assert_called_once_with(0, app.toggle_playback)
+        app.toggle_recording.assert_not_called()
+
+    def test_f8_still_stops_active_tasks(self):
+        app = MacroApp.__new__(MacroApp)
+        app.capturing_hotkey = False
+        app.recording = True
+        app.playing = app.clicking = False
+        app.red_monitor = Mock(running=False)
+        app.root = Mock()
+        app.stop_all = Mock()
+
+        app._global_key_press(keyboard.Key.f8)
+
+        app.root.after.assert_called_once_with(0, app.stop_all)
+
     def test_key_round_trip(self):
         for key in (keyboard.Key.enter, keyboard.KeyCode.from_char("中"), keyboard.KeyCode.from_vk(65)):
             key_type, value = encode_key(key)
