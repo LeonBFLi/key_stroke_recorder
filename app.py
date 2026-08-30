@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from collections import deque
@@ -169,6 +170,23 @@ def parse_click_rate(value: str) -> float:
     return rate
 
 
+def program_directory() -> Path:
+    """Return the directory containing the script or packaged executable."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def save_red_detection_screenshot(image, directory: Path | None = None,
+                                  captured_at: datetime | None = None) -> Path:
+    """Save the monitored region that caused the close action."""
+    destination = directory or program_directory()
+    timestamp = (captured_at or datetime.now()).strftime("%Y%m%d_%H%M%S_%f")
+    path = destination / f"red_dot_detection_{timestamp}.png"
+    image.save(path, format="PNG")
+    return path
+
+
 def parse_hotkey(value: str) -> frozenset[keyboard.Key | keyboard.KeyCode]:
     """Parse pynput's portable hotkey syntax and reserve F8 for emergency stop."""
     try:
@@ -244,7 +262,7 @@ class MacroApp:
         monitor_tab = ttk.Frame(notebook, padding=12)
         notebook.add(outer, text="键盘鼠标录制与回放")
         notebook.add(monitor_tab, text="红点监控")
-        self.red_monitor = RedMonitorPanel(monitor_tab)
+        self.red_monitor = RedMonitorPanel(monitor_tab, on_close_trigger=self.stop_playback.set)
 
         ttk.Label(outer, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
         ttk.Label(outer, text="空闲时按 F8 可运行已加载的录制；运行时按 F8 可随时停止所有任务。", foreground="#555").pack(anchor="w", pady=(4, 18))
@@ -744,13 +762,14 @@ def count_red_blob_pixels(image, red_threshold: int, delta_threshold: int, green
 class RedMonitorPanel:
     """Red-dot monitor embedded in the application's second tab."""
 
-    def __init__(self, parent: ttk.Frame) -> None:
+    def __init__(self, parent: ttk.Frame, on_close_trigger=None) -> None:
         self.parent = parent
         self.root = parent.winfo_toplevel()
         self.region: Region | None = None
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.running = False
+        self.on_close_trigger = on_close_trigger or (lambda: None)
         self.settings = {
             # Include dim/anti-aliased edge pixels commonly found in small UI
             # notification dots. Component and temporal filtering below still
@@ -880,7 +899,19 @@ class RedMonitorPanel:
                     remaining = float(settings["close_delay"]) - (now - detected_at)
                     if remaining <= 0:
                         action_done = True
-                        self.root.after(0, self._close_foreground_window)
+                        # Stop macro input before asking the target window to
+                        # close, so no later recorded keyboard/mouse event can
+                        # act on a different foreground window.
+                        self.on_close_trigger()
+                        screenshot_path: Path | None = None
+                        screenshot_error: Exception | None = None
+                        try:
+                            screenshot_path = save_red_detection_screenshot(image)
+                        except Exception as exc:
+                            screenshot_error = exc
+                        self.root.after(
+                            0, lambda path=screenshot_path, error=screenshot_error:
+                            self._close_foreground_window(path, error))
                     else:
                         self.root.after(0, lambda seconds=remaining: self.status.set(
                             f"状态：检测到红点，若持续存在将在 {seconds:.1f} 秒后关闭当前窗口"))
@@ -900,7 +931,12 @@ class RedMonitorPanel:
         self.status.set("状态：红点已消失，继续监控")
         self._log("红点在倒计时结束前消失，已取消关闭窗口")
 
-    def _close_foreground_window(self) -> None:
+    def _close_foreground_window(self, screenshot_path: Path | None = None,
+                                 screenshot_error: Exception | None = None) -> None:
+        if screenshot_path is not None:
+            self._log(f"已停止键盘鼠标回放，并保存红点区域截图：{screenshot_path}")
+        elif screenshot_error is not None:
+            self._log(f"已停止键盘鼠标回放，但保存红点区域截图失败：{screenshot_error}")
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetForegroundWindow()
