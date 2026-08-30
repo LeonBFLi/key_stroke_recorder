@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from pynput import keyboard, mouse
 from app import (KeyEvent, MacroApp, MouseEvent, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
-                 load_events, parse_click_rate, parse_hotkey, save_events)
+                 load_events, parse_click_rate, parse_hotkey, save_events, save_red_detection_screenshot)
 
 
 class FakeImage:
@@ -19,6 +19,9 @@ class FakeImage:
 
     def getdata(self):
         return self._pixels
+
+    def save(self, path, format=None):
+        self.saved = (path, format)
 
 
 class StorageTests(unittest.TestCase):
@@ -148,6 +151,14 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(tracker.update(False), (True, False))
         self.assertEqual(tracker.update(False), (True, False))
         self.assertEqual(tracker.update(False), (False, True))
+
+    def test_red_detection_screenshot_is_saved_in_requested_directory(self):
+        image = FakeImage(1, 1, [(255, 0, 0)])
+        captured_at = __import__("datetime").datetime(2026, 8, 30, 12, 34, 56, 789)
+        with tempfile.TemporaryDirectory() as folder:
+            path = save_red_detection_screenshot(image, Path(folder), captured_at)
+        self.assertEqual(path.name, "red_dot_detection_20260830_123456_000789.png")
+        self.assertEqual(image.saved, (path, "PNG"))
 
 
 if __name__ == "__main__":
