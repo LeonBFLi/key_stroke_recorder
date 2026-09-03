@@ -141,6 +141,19 @@ class StorageTests(unittest.TestCase):
         image = FakeImage(10, 10, pixels)
         self.assertEqual(count_red_blob_pixels(image, 180, 55, 165, 165, 85, 5, 30), 6)
 
+    def test_red_detection_rejects_yellow_but_accepts_red_orange(self):
+        pixels = [(30, 30, 30)] * 100
+        for y in range(3, 7):
+            for x in range(3, 7):
+                pixels[y * 10 + x] = (245, 165, 15)
+        image = FakeImage(10, 10, pixels)
+        self.assertEqual(count_red_blob_pixels(image, 180, 55, 200, 165, 85, 5, 30), 0)
+
+        for y in range(3, 7):
+            for x in range(3, 7):
+                pixels[y * 10 + x] = (245, 70, 40)
+        self.assertEqual(count_red_blob_pixels(image, 180, 55, 200, 165, 85, 5, 30), 16)
+
     def test_red_presence_filter_tolerates_brief_misses_and_movement(self):
         tracker = RedPresenceFilter(detect_confirmations=2, missing_confirmations=3)
         self.assertEqual(tracker.update(True), (False, False))
