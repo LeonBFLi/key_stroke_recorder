@@ -25,6 +25,8 @@ APP_NAME = "键盘鼠标录制、回放与红点监控工具"
 FILE_VERSION = 2
 MIN_CLICK_RATE = 0.5
 MAX_CLICK_RATE = 100.0
+MIN_AUTO_KEY_INTERVAL = 0.1
+MAX_AUTO_KEY_INTERVAL = 86400.0
 RED_DETECT_CONFIRMATIONS = 2
 RED_MISSING_CONFIRMATIONS = 5
 HotkeyInput = keyboard.Key | keyboard.KeyCode | mouse.Button
@@ -237,10 +239,12 @@ class MacroApp:
         self.capturing_hotkey = False
         self.hotkey_capture_started = False
         self.hotkey_capture_keys: set[HotkeyInput] = set()
+        self.auto_key_slots: list[dict[str, object]] = []
+        self.capturing_auto_key: int | None = None
 
         root.title(APP_NAME)
-        root.geometry("780x720")
-        root.minsize(700, 620)
+        root.geometry("820x880")
+        root.minsize(740, 760)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._build_ui()
 
@@ -310,6 +314,32 @@ class MacroApp:
         self.click_button.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(10, 0))
         click_box.columnconfigure(3, weight=1)
 
+        auto_box = ttk.LabelFrame(outer, text="4. 定时按键（最多 5 个，可同时运行）", padding=12)
+        auto_box.pack(fill="x", pady=(0, 14))
+        ttk.Label(auto_box, text="按键").grid(row=0, column=0)
+        ttk.Label(auto_box, text="间隔（秒）").grid(row=0, column=2)
+        for index in range(5):
+            key_var = tk.StringVar(value="未设置")
+            interval_var = tk.StringVar(value="10")
+            stop_event = threading.Event()
+            slot: dict[str, object] = {
+                "key": None, "key_var": key_var, "interval_var": interval_var,
+                "stop_event": stop_event, "running": False,
+            }
+            self.auto_key_slots.append(slot)
+            ttk.Label(auto_box, text=f"{index + 1}.").grid(row=index + 1, column=0, sticky="e", pady=3)
+            ttk.Label(auto_box, width=14, textvariable=key_var, relief="sunken", padding=(5, 3)).grid(
+                row=index + 1, column=1, sticky="ew", padx=(4, 8), pady=3)
+            ttk.Entry(auto_box, width=10, textvariable=interval_var).grid(row=index + 1, column=2, pady=3)
+            ttk.Button(auto_box, text="录入按键", command=lambda i=index: self.start_auto_key_capture(i)).grid(
+                row=index + 1, column=3, padx=8, pady=3)
+            button = ttk.Button(auto_box, text="开始", command=lambda i=index: self.toggle_auto_key(i))
+            button.grid(row=index + 1, column=4, pady=3)
+            slot["button"] = button
+        ttk.Label(auto_box, text="每项会等待设定间隔后按一次键；F8 可停止全部任务。", foreground="#666").grid(
+            row=6, column=0, columnspan=5, sticky="w", pady=(5, 0))
+        auto_box.columnconfigure(1, weight=1)
+
         status_box = ttk.LabelFrame(outer, text="状态", padding=12)
         status_box.pack(fill="both", expand=True)
         self.status = tk.StringVar(value="就绪")
@@ -322,6 +352,9 @@ class MacroApp:
         if self.clicking:
             messagebox.showwarning("无法设置热键", "请先停止鼠标连点。")
             return
+        if self.capturing_auto_key is not None:
+            messagebox.showwarning("无法设置热键", "请先完成定时按键的录入。")
+            return
         self.capturing_hotkey = True
         self.hotkey_capture_started = False
         self.hotkey_capture_keys.clear()
@@ -330,6 +363,34 @@ class MacroApp:
         self.click_button.configure(state="disabled")
         self.click_hotkey_var.set("等待按下热键…")
         self.status.set("请按下要使用的键盘按键、组合键或鼠标键；松开后即完成设置。")
+
+    def start_auto_key_capture(self, index: int) -> None:
+        if self.capturing_hotkey:
+            messagebox.showwarning("无法录入按键", "请先完成鼠标连点热键的设置。")
+            return
+        if bool(self.auto_key_slots[index]["running"]):
+            messagebox.showwarning("无法录入按键", "请先停止这一项定时按键。")
+            return
+        self.capturing_auto_key = index
+        key_var = self.auto_key_slots[index]["key_var"]
+        assert isinstance(key_var, tk.StringVar)
+        key_var.set("请按一个键…")
+        self.status.set(f"请按下第 {index + 1} 项要自动发送的单个键；F8 不可使用。")
+
+    def _capture_auto_key(self, key: keyboard.Key | keyboard.KeyCode) -> None:
+        index = self.capturing_auto_key
+        if index is None:
+            return
+        if key == keyboard.Key.f8:
+            messagebox.showwarning("按键不可用", "F8 是紧急停止键，请选择其他按键。")
+            return
+        self.capturing_auto_key = None
+        slot = self.auto_key_slots[index]
+        slot["key"] = key
+        key_var = slot["key_var"]
+        assert isinstance(key_var, tk.StringVar)
+        key_var.set(format_hotkey(frozenset({key})))
+        self.status.set(f"第 {index + 1} 项按键已录入。")
 
     def _capture_hotkey_press(self, key: HotkeyInput) -> None:
         if key == keyboard.Key.f8:
@@ -371,6 +432,10 @@ class MacroApp:
         self.count_spin.configure(state="normal" if self.loop_mode.get() == "count" else "disabled")
 
     def _global_key_press(self, key: keyboard.Key | keyboard.KeyCode) -> None:
+        if getattr(self, "capturing_auto_key", None) is not None:
+            canonical = self.hotkey_listener.canonical(key)
+            self.root.after(0, lambda captured=canonical: self._capture_auto_key(captured))
+            return
         if key == keyboard.Key.f8:
             if self.capturing_hotkey:
                 self._capture_hotkey_press(key)
@@ -378,7 +443,8 @@ class MacroApp:
             # F8 runs the currently loaded/captured macro while idle. It is not
             # tied to starting a recording; while a task is active it retains
             # its emergency-stop behaviour for every feature.
-            if not (self.recording or self.playing or self.clicking or self.red_monitor.running):
+            if not (self.recording or self.playing or self.clicking or self.red_monitor.running
+                    or any(bool(slot["running"]) for slot in getattr(self, "auto_key_slots", []))):
                 self.root.after(0, self.toggle_playback)
             else:
                 self.root.after(0, self.stop_all)
@@ -648,6 +714,61 @@ class MacroApp:
         else:
             self.status.set("鼠标连点已停止。")
 
+    def toggle_auto_key(self, index: int) -> None:
+        slot = self.auto_key_slots[index]
+        stop_event = slot["stop_event"]
+        button = slot["button"]
+        assert isinstance(stop_event, threading.Event) and isinstance(button, ttk.Button)
+        if bool(slot["running"]):
+            stop_event.set()
+            return
+        key = slot["key"]
+        if key is None:
+            messagebox.showwarning("定时按键未设置", "请先点击“录入按键”。")
+            return
+        interval_var = slot["interval_var"]
+        assert isinstance(interval_var, tk.StringVar)
+        try:
+            interval = float(interval_var.get())
+            if not MIN_AUTO_KEY_INTERVAL <= interval <= MAX_AUTO_KEY_INTERVAL:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("间隔无效", "间隔必须是 0.1 到 86400 秒之间的数字。")
+            return
+        slot["running"] = True
+        stop_event.clear()
+        button.configure(text="停止")
+        self.status.set(f"第 {index + 1} 项定时按键已启动，每 {interval:g} 秒按一次。")
+        threading.Thread(target=self._auto_key_worker, args=(index, key, interval), daemon=True).start()
+
+    def _auto_key_worker(self, index: int, key: keyboard.Key | keyboard.KeyCode, interval: float) -> None:
+        slot = self.auto_key_slots[index]
+        stop_event = slot["stop_event"]
+        assert isinstance(stop_event, threading.Event)
+        controller = keyboard.Controller()
+        error: Exception | None = None
+        try:
+            next_press = time.perf_counter() + interval
+            while not stop_event.wait(max(0.0, next_press - time.perf_counter())):
+                controller.press(key)
+                controller.release(key)
+                next_press += interval
+                if next_press < time.perf_counter():
+                    next_press = time.perf_counter() + interval
+        except Exception as exc:
+            error = exc
+        self.root.after(0, lambda: self._auto_key_finished(index, error))
+
+    def _auto_key_finished(self, index: int, error: Exception | None) -> None:
+        slot = self.auto_key_slots[index]
+        slot["running"] = False
+        button = slot["button"]
+        assert isinstance(button, ttk.Button)
+        button.configure(text="开始")
+        if error:
+            messagebox.showerror("定时按键失败", str(error))
+        self.status.set(f"第 {index + 1} 项定时按键已停止。")
+
     def _play_finished(self, completed: int, error: Exception | None) -> None:
         self.playing = False
         self.progress.stop()
@@ -666,6 +787,11 @@ class MacroApp:
             self.stop_playback.set()
         if self.clicking:
             self.stop_clicking.set()
+        for slot in self.auto_key_slots:
+            if bool(slot["running"]):
+                stop_event = slot["stop_event"]
+                assert isinstance(stop_event, threading.Event)
+                stop_event.set()
         self.red_monitor.stop(silent=True)
 
     def close(self) -> None:
@@ -720,15 +846,17 @@ class RegionSelector(tk.Toplevel):
 
 def count_red_blob_pixels(image, red_threshold: int, delta_threshold: int, green_max: int,
                           blue_max: int, min_saturation: int, min_blob_pixels: int,
-                          min_blob_density: int) -> int:
-    """Count pixels belonging to sufficiently large, dense red components."""
+                          min_blob_density: int, max_secondary_ratio: int = 55) -> int:
+    """Count compact, genuinely red components while rejecting yellow/orange UI art."""
     rgb = image.convert("RGB")
     width, height = rgb.size
     candidates: list[bool] = []
     for red, green, blue in rgb.getdata():
         maximum, minimum = max(red, green, blue), min(red, green, blue)
         saturation = int((maximum - minimum) / maximum * 255) if maximum else 0
+        secondary_limit = red * max_secondary_ratio / 100
         candidates.append(red >= red_threshold and green <= green_max and blue <= blue_max
+                          and green <= secondary_limit and blue <= secondary_limit
                           and red - green >= delta_threshold and red - blue >= delta_threshold
                           and saturation >= min_saturation)
 
@@ -778,6 +906,7 @@ class RedMonitorPanel:
             "green_max": tk.IntVar(value=165), "blue_max": tk.IntVar(value=165),
             "min_saturation": tk.IntVar(value=85), "min_blob_pixels": tk.IntVar(value=5),
             "min_blob_density": tk.IntVar(value=30), "min_red_pixels": tk.IntVar(value=5),
+            "max_secondary_ratio": tk.IntVar(value=55),
             "check_interval": tk.IntVar(value=120), "close_delay": tk.DoubleVar(value=10),
         }
         self._build_ui()
@@ -795,6 +924,7 @@ class RedMonitorPanel:
             ("绿色上限", "green_max"), ("蓝色上限", "blue_max"),
             ("最小饱和度 (0–255)", "min_saturation"), ("最少红像素", "min_red_pixels"),
             ("最小红团像素", "min_blob_pixels"), ("最小红团密度 (%)", "min_blob_density"),
+            ("绿/蓝占红色上限 (%)", "max_secondary_ratio"),
             ("检测间隔 (ms)", "check_interval"), ("持续 N 秒后关闭窗口", "close_delay"),
         ]
         for index, (label, key) in enumerate(fields):
@@ -804,20 +934,20 @@ class RedMonitorPanel:
             ttk.Entry(self.parent, textvariable=self.settings[key], width=10).grid(row=row, column=column + 1, sticky="w")
 
         buttons = ttk.Frame(self.parent)
-        buttons.grid(row=8, column=0, columnspan=4, sticky="w", pady=12)
+        buttons.grid(row=9, column=0, columnspan=4, sticky="w", pady=12)
         self.start_button = ttk.Button(buttons, text="开始监控", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止监控", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="状态：待机")
-        ttk.Label(self.parent, textvariable=self.status).grid(row=9, column=0, columnspan=4, sticky="w")
+        ttk.Label(self.parent, textvariable=self.status).grid(row=10, column=0, columnspan=4, sticky="w")
         log_frame = ttk.LabelFrame(self.parent, text="运行日志", padding=6)
-        log_frame.grid(row=10, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
+        log_frame.grid(row=11, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
         self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True)
         for column in range(4):
             self.parent.columnconfigure(column, weight=1)
-        self.parent.rowconfigure(10, weight=1)
+        self.parent.rowconfigure(11, weight=1)
 
     def select_region(self) -> None:
         RegionSelector(self.root, self._region_selected)
@@ -837,6 +967,8 @@ class RedMonitorPanel:
             raise ValueError("像素数量必须至少为 1，红色优势不能小于 0。")
         if not 1 <= values["min_blob_density"] <= 100:
             raise ValueError("红团密度必须在 1% 到 100% 之间。")
+        if not 1 <= values["max_secondary_ratio"] <= 100:
+            raise ValueError("绿/蓝占红色比例必须在 1% 到 100% 之间。")
         if values["check_interval"] < 20 or values["close_delay"] < 0:
             raise ValueError("检测间隔至少为 20 ms，关闭等待时间不能小于 0 秒。")
         return values
@@ -884,7 +1016,8 @@ class RedMonitorPanel:
                 image = ImageGrab.grab(bbox=(region.left, region.top, region.right, region.bottom))
                 red_count = count_red_blob_pixels(
                     image, *(int(settings[key]) for key in ("red_threshold", "delta_threshold", "green_max",
-                           "blue_max", "min_saturation", "min_blob_pixels", "min_blob_density")))
+                           "blue_max", "min_saturation", "min_blob_pixels", "min_blob_density",
+                           "max_secondary_ratio")))
                 now = time.monotonic()
                 has_red, changed = presence.update(red_count >= int(settings["min_red_pixels"]))
                 if has_red and changed:
