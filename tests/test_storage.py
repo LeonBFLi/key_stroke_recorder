@@ -6,7 +6,8 @@ from unittest.mock import Mock, patch
 
 from pynput import keyboard, mouse
 from app import (KeyEvent, MacroApp, MouseEvent, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
-                 load_events, parse_click_rate, parse_hotkey, save_events, save_red_detection_screenshot)
+                 load_events, parse_click_rate, parse_hotkey, save_events, save_red_detection_screenshot,
+                 signature_difference, visual_signature)
 
 
 class FakeImage:
@@ -20,6 +21,11 @@ class FakeImage:
     def getdata(self):
         return self._pixels
 
+    def resize(self, size, _resampling):
+        # Tests below use the signature's native sample size.
+        self.size = size
+        return self
+
     def save(self, path, format=None):
         self.saved = (path, format)
 
@@ -30,6 +36,7 @@ class StorageTests(unittest.TestCase):
         app.capturing_hotkey = False
         app.recording = app.playing = app.clicking = False
         app.red_monitor = Mock(running=False)
+        app.yellow_monitor = Mock(running=False)
         app.root = Mock()
         app.toggle_playback = Mock()
         app.toggle_recording = Mock()
@@ -45,6 +52,7 @@ class StorageTests(unittest.TestCase):
         app.recording = True
         app.playing = app.clicking = False
         app.red_monitor = Mock(running=False)
+        app.yellow_monitor = Mock(running=False)
         app.root = Mock()
         app.stop_all = Mock()
 
@@ -172,6 +180,19 @@ class StorageTests(unittest.TestCase):
             path = save_red_detection_screenshot(image, Path(folder), captured_at)
         self.assertEqual(path.name, "red_dot_detection_20260830_123456_000789.png")
         self.assertEqual(image.saved, (path, "PNG"))
+
+    def test_visual_signature_tracks_yellow_bar_and_number_changes(self):
+        pixels = [(20, 20, 20)] * (48 * 16)
+        for index in range(100):
+            pixels[index] = (230, 190, 20)
+        first, yellow_count = visual_signature(FakeImage(48, 16, pixels))
+        self.assertEqual(yellow_count, 100)
+
+        changed = list(pixels)
+        changed[300:320] = [(240, 240, 240)] * 20  # changed digit strokes
+        second, _ = visual_signature(FakeImage(48, 16, changed))
+        self.assertGreater(signature_difference(first, second), 0)
+        self.assertEqual(signature_difference(first, first), 0)
 
 
 if __name__ == "__main__":
