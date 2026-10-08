@@ -1,11 +1,12 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from pynput import keyboard, mouse
-from app import (KeyEvent, MacroApp, MouseEvent, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
+from app import (KeyEvent, MacroApp, MouseEvent, RedMonitorPanel, YellowStabilityMonitorPanel, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
                  load_events, parse_click_rate, parse_hotkey, save_events, save_red_detection_screenshot,
                  signature_difference, visual_signature)
 
@@ -28,6 +29,87 @@ class FakeImage:
 
     def save(self, path, format=None):
         self.saved = (path, format)
+
+
+class MonitorActionTests(unittest.TestCase):
+    def make_panel(self, panel_class):
+        panel = panel_class.__new__(panel_class)
+        panel.root = Mock()
+        panel.running = True
+        panel.stop_event = threading.Event()
+        panel.start_button = Mock()
+        panel.stop_button = Mock()
+        panel.status = Mock()
+        panel._log = Mock()
+        panel.sound_on_detection = Mock(get=Mock(return_value=False))
+        return panel
+
+    def test_red_detection_sound_can_be_disabled(self):
+        panel = self.make_panel(RedMonitorPanel)
+        with patch("app.play_notification_sound") as sound:
+            panel._first_detected(12)
+            sound.assert_not_called()
+            panel._log.assert_called_with("检测到红点（12 像素），已开始倒计时")
+            panel.sound_on_detection.get.return_value = True
+            panel._first_detected(12)
+            sound.assert_called_once_with(panel.root)
+
+    def test_either_monitor_close_stops_all_tasks_and_always_sounds(self):
+        for trigger_class in (RedMonitorPanel, YellowStabilityMonitorPanel):
+            with self.subTest(trigger=trigger_class.__name__):
+                app = MacroApp.__new__(MacroApp)
+                app.recording = app.playing = app.clicking = True
+                app.stop_recording = Mock()
+                app.stop_playback = threading.Event()
+                app.stop_clicking = threading.Event()
+                auto_stop = threading.Event()
+                app.auto_key_slots = [{"running": True, "stop_event": auto_stop}]
+                app.red_monitor = self.make_panel(RedMonitorPanel)
+                app.yellow_monitor = self.make_panel(YellowStabilityMonitorPanel)
+                for panel in (app.red_monitor, app.yellow_monitor):
+                    panel.on_close_trigger = app.stop_all
+                trigger = app.red_monitor if trigger_class is RedMonitorPanel else app.yellow_monitor
+                other = app.yellow_monitor if trigger_class is RedMonitorPanel else app.red_monitor
+
+                def assert_stopped(*_args):
+                    app.stop_recording.assert_called_once()
+                    self.assertTrue(app.stop_playback.is_set())
+                    self.assertTrue(app.stop_clicking.is_set())
+                    self.assertTrue(auto_stop.is_set())
+                    for panel in (trigger, other):
+                        self.assertFalse(panel.running)
+                        self.assertTrue(panel.stop_event.is_set())
+
+                user32 = Mock()
+                user32.GetForegroundWindow.return_value = 123
+                user32.PostMessageW.side_effect = assert_stopped
+                with patch("ctypes.windll", Mock(user32=user32), create=True), \
+                        patch("app.play_notification_sound", side_effect=assert_stopped) as sound:
+                    trigger._close_foreground_window()
+                    user32.PostMessageW.assert_called_once_with(123, 0x0010, 0, 0)
+                    sound.assert_called_once_with(trigger.root)
+                    # A queued callback from the other monitor must not close
+                    # the next foreground window or play another alert.
+                    other._close_foreground_window()
+                    trigger._close_foreground_window()
+                    self.assertEqual(user32.PostMessageW.call_count, 1)
+                    self.assertEqual(sound.call_count, 1)
+
+    def test_close_failure_still_stops_monitor_and_sounds(self):
+        for panel_class in (RedMonitorPanel, YellowStabilityMonitorPanel):
+            with self.subTest(trigger=panel_class.__name__):
+                panel = self.make_panel(panel_class)
+                panel.on_close_trigger = Mock()
+                user32 = Mock()
+                user32.GetForegroundWindow.return_value = 0
+                with patch("ctypes.windll", Mock(user32=user32), create=True), \
+                        patch("app.play_notification_sound") as sound:
+                    panel._close_foreground_window()
+                    panel.on_close_trigger.assert_called_once()
+                    self.assertFalse(panel.running)
+                    self.assertTrue(panel.stop_event.is_set())
+                    sound.assert_called_once_with(panel.root)
+                    user32.PostMessageW.assert_not_called()
 
 
 class StorageTests(unittest.TestCase):
