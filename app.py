@@ -250,6 +250,14 @@ def format_hotkey(keys: frozenset[HotkeyInput]) -> str:
     return " + ".join(labels)
 
 
+def play_notification_sound(root: tk.Misc) -> None:
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    except (ImportError, RuntimeError):  # pragma: no cover - Windows normally supplies winsound
+        root.bell()
+
+
 class MacroApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -299,8 +307,8 @@ class MacroApp:
         notebook.add(outer, text="宏与自动操作")
         notebook.add(monitor_tab, text="红点监控")
         notebook.add(yellow_tab, text="黄色进度监控")
-        self.red_monitor = RedMonitorPanel(monitor_tab, on_close_trigger=self.stop_playback.set)
-        self.yellow_monitor = YellowStabilityMonitorPanel(yellow_tab, on_close_trigger=self.stop_playback.set)
+        self.red_monitor = RedMonitorPanel(monitor_tab, on_close_trigger=self.stop_all)
+        self.yellow_monitor = YellowStabilityMonitorPanel(yellow_tab, on_close_trigger=self.stop_all)
 
         ttk.Label(outer, text="宏与自动操作", font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
         ttk.Label(outer, text="空闲时 F8 运行录制；任一功能运行时 F8 紧急停止。", foreground="#555").pack(anchor="w", pady=(2, 6))
@@ -943,6 +951,7 @@ class RedMonitorPanel:
         self.worker: threading.Thread | None = None
         self.running = False
         self.on_close_trigger = on_close_trigger or (lambda: None)
+        self.sound_on_detection = tk.BooleanVar(value=True)
         self.settings = {
             # Include dim/anti-aliased edge pixels commonly found in small UI
             # notification dots. Component and temporal filtering below still
@@ -958,7 +967,7 @@ class RedMonitorPanel:
 
     def _build_ui(self) -> None:
         ttk.Label(self.parent, text="红点监控", font=("Microsoft YaHei UI", 16, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(self.parent, text="发现红点时立即提示；持续存在到设定时间后关闭当时的前台窗口。",
+        ttk.Label(self.parent, text="检测提示音可选；触发关闭时停止全部任务并播放提示音。",
                   foreground="#555").grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 14))
         ttk.Button(self.parent, text="选择监控区域", command=self.select_region).grid(row=2, column=0, sticky="w")
         self.region_label = ttk.Label(self.parent, text="尚未选择区域")
@@ -978,21 +987,23 @@ class RedMonitorPanel:
             ttk.Label(self.parent, text=label).grid(row=row, column=column, sticky="w", pady=7)
             ttk.Entry(self.parent, textvariable=self.settings[key], width=10).grid(row=row, column=column + 1, sticky="w")
 
+        ttk.Checkbutton(self.parent, text="检测到红点时播放提示音", variable=self.sound_on_detection).grid(
+            row=9, column=0, columnspan=4, sticky="w", pady=(4, 0))
         buttons = ttk.Frame(self.parent)
-        buttons.grid(row=9, column=0, columnspan=4, sticky="w", pady=12)
+        buttons.grid(row=10, column=0, columnspan=4, sticky="w", pady=12)
         self.start_button = ttk.Button(buttons, text="开始监控", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止监控", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="状态：待机")
-        ttk.Label(self.parent, textvariable=self.status).grid(row=10, column=0, columnspan=4, sticky="w")
+        ttk.Label(self.parent, textvariable=self.status).grid(row=11, column=0, columnspan=4, sticky="w")
         log_frame = ttk.LabelFrame(self.parent, text="运行日志", padding=6)
-        log_frame.grid(row=11, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
+        log_frame.grid(row=12, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
         self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True)
         for column in range(4):
             self.parent.columnconfigure(column, weight=1)
-        self.parent.rowconfigure(11, weight=1)
+        self.parent.rowconfigure(12, weight=1)
 
     def select_region(self) -> None:
         RegionSelector(self.root, self._region_selected)
@@ -1077,10 +1088,6 @@ class RedMonitorPanel:
                     remaining = float(settings["close_delay"]) - (now - detected_at)
                     if remaining <= 0:
                         action_done = True
-                        # Stop macro input before asking the target window to
-                        # close, so no later recorded keyboard/mouse event can
-                        # act on a different foreground window.
-                        self.on_close_trigger()
                         screenshot_path: Path | None = None
                         screenshot_error: Exception | None = None
                         try:
@@ -1090,6 +1097,7 @@ class RedMonitorPanel:
                         self.root.after(
                             0, lambda path=screenshot_path, error=screenshot_error:
                             self._close_foreground_window(path, error))
+                        return
                     else:
                         self.root.after(0, lambda seconds=remaining: self.status.set(
                             f"状态：检测到红点，若持续存在将在 {seconds:.1f} 秒后关闭当前窗口"))
@@ -1098,12 +1106,13 @@ class RedMonitorPanel:
             self.root.after(0, lambda error=exc: self._monitor_failed(error))
 
     def _first_detected(self, count: int) -> None:
-        try:
-            import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-        except (ImportError, RuntimeError):  # pragma: no cover - Windows normally supplies winsound
-            self.root.bell()
-        self._log(f"检测到红点（{count} 像素），已播放提示音并开始倒计时")
+        if not self.running or self.stop_event.is_set():
+            return
+        if self.sound_on_detection.get():
+            play_notification_sound(self.root)
+            self._log(f"检测到红点（{count} 像素），已播放提示音并开始倒计时")
+        else:
+            self._log(f"检测到红点（{count} 像素），已开始倒计时")
 
     def _red_disappeared(self) -> None:
         self.status.set("状态：红点已消失，继续监控")
@@ -1111,10 +1120,16 @@ class RedMonitorPanel:
 
     def _close_foreground_window(self, screenshot_path: Path | None = None,
                                  screenshot_error: Exception | None = None) -> None:
+        if not self.running or self.stop_event.is_set():
+            return
+        # Run on Tk's main thread: stop_all also updates both monitor panels.
+        self.on_close_trigger()
+        self.stop(silent=True)
+        play_notification_sound(self.root)
         if screenshot_path is not None:
-            self._log(f"已停止键盘鼠标回放，并保存红点区域截图：{screenshot_path}")
+            self._log(f"已停止全部监控和自动操作，并保存红点区域截图：{screenshot_path}")
         elif screenshot_error is not None:
-            self._log(f"已停止键盘鼠标回放，但保存红点区域截图失败：{screenshot_error}")
+            self._log(f"已停止全部监控和自动操作，但保存红点区域截图失败：{screenshot_error}")
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -1247,7 +1262,6 @@ class YellowStabilityMonitorPanel:
                 elif unchanged_since is not None:
                     elapsed = now - unchanged_since
                     if elapsed >= stall_seconds:
-                        self.on_close_trigger()
                         self.root.after(0, self._close_foreground_window)
                         return
                     remaining = stall_seconds - elapsed
@@ -1259,6 +1273,11 @@ class YellowStabilityMonitorPanel:
             self.root.after(0, lambda error=exc: self._failed(error))
 
     def _close_foreground_window(self) -> None:
+        if not self.running or self.stop_event.is_set():
+            return
+        self.on_close_trigger()
+        self.stop(silent=True)
+        play_notification_sound(self.root)
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetForegroundWindow()
