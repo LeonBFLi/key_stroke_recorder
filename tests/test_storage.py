@@ -1,12 +1,13 @@
 import json
 import tempfile
 import threading
+import tkinter as tk
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from pynput import keyboard, mouse
-from app import (KeyEvent, MacroApp, MouseEvent, RedMonitorPanel, YellowStabilityMonitorPanel, RedPresenceFilter, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
+from app import (KeyEvent, MacroApp, MouseEvent, Region, RedMonitorPanel, YellowStabilityMonitorPanel, RedPresenceFilter, save_configuration, count_red_blob_pixels, decode_key, encode_key, format_hotkey,
                  load_events, parse_click_rate, parse_hotkey, save_events, save_red_detection_screenshot,
                  signature_difference, visual_signature)
 
@@ -44,6 +45,37 @@ class MonitorActionTests(unittest.TestCase):
         panel.sound_on_detection = Mock(get=Mock(return_value=False))
         return panel
 
+    def test_yellow_disappearance_only_closes_after_tracking_when_enabled(self):
+        for enabled, counts, expected in ((True, [0, 12, 0], True),
+                                          (True, [0, 0, 0], False),
+                                          (False, [0, 12, 0], False)):
+            with self.subTest(enabled=enabled, counts=counts):
+                panel = self.make_panel(YellowStabilityMonitorPanel)
+                frames = iter(counts)
+                panel._close_foreground_window = Mock()
+                panel._failed = Mock()
+                panel.root.after.side_effect = lambda _delay, callback: callback()
+
+                def signature(_image):
+                    return b"frame", next(frames)
+
+                waits = 0
+
+                def wait(_seconds):
+                    nonlocal waits
+                    waits += 1
+                    if waits >= len(counts):
+                        panel.stop_event.set()
+
+                with patch("app.ImageGrab.grab"), patch("app.visual_signature", side_effect=signature), \
+                        patch.object(panel.stop_event, "wait", side_effect=wait):
+                    panel._monitor(Region(0, 0, 10, 10), (999, 50, 8, 1.0, enabled))
+                panel._failed.assert_not_called()
+                if expected:
+                    panel._close_foreground_window.assert_called_once_with(disappeared=True)
+                else:
+                    panel._close_foreground_window.assert_not_called()
+
     def test_red_detection_sound_can_be_disabled(self):
         panel = self.make_panel(RedMonitorPanel)
         with patch("app.play_notification_sound") as sound:
@@ -55,8 +87,10 @@ class MonitorActionTests(unittest.TestCase):
             sound.assert_called_once_with(panel.root)
 
     def test_either_monitor_close_stops_all_tasks_and_always_sounds(self):
-        for trigger_class in (RedMonitorPanel, YellowStabilityMonitorPanel):
-            with self.subTest(trigger=trigger_class.__name__):
+        for trigger_class, disappeared in ((RedMonitorPanel, False),
+                                           (YellowStabilityMonitorPanel, False),
+                                           (YellowStabilityMonitorPanel, True)):
+            with self.subTest(trigger=trigger_class.__name__, disappeared=disappeared):
                 app = MacroApp.__new__(MacroApp)
                 app.recording = app.playing = app.clicking = True
                 app.stop_recording = Mock()
@@ -85,7 +119,10 @@ class MonitorActionTests(unittest.TestCase):
                 user32.PostMessageW.side_effect = assert_stopped
                 with patch("ctypes.windll", Mock(user32=user32), create=True), \
                         patch("app.play_notification_sound", side_effect=assert_stopped) as sound:
-                    trigger._close_foreground_window()
+                    if disappeared:
+                        trigger._close_foreground_window(disappeared=True)
+                    else:
+                        trigger._close_foreground_window()
                     user32.PostMessageW.assert_called_once_with(123, 0x0010, 0, 0)
                     sound.assert_called_once_with(trigger.root)
                     # A queued callback from the other monitor must not close
@@ -110,6 +147,128 @@ class MonitorActionTests(unittest.TestCase):
                     self.assertTrue(panel.stop_event.is_set())
                     sound.assert_called_once_with(panel.root)
                     user32.PostMessageW.assert_not_called()
+
+
+class ConfigurationTests(unittest.TestCase):
+    def make_app(self):
+        interpreter = tk.Tcl()
+        app = MacroApp.__new__(MacroApp)
+        app.root = Mock()
+        app.root.globalgetvar.side_effect = interpreter.globalgetvar
+        app.root.geometry.return_value = "820x620+20+30"
+        app.loop_mode = tk.StringVar(interpreter, "forever")
+        app.count_var = tk.StringVar(interpreter, "27")
+        app.click_rate_var = tk.StringVar(interpreter, "18.5")
+        app.click_hotkey = frozenset({keyboard.KeyCode.from_char("c"), mouse.Button.right})
+        app.click_hotkey_var = tk.StringVar(interpreter)
+        app.auto_key_slots = [{"key": keyboard.KeyCode.from_char(str(index)),
+                               "key_var": tk.StringVar(interpreter),
+                               "interval_var": tk.StringVar(interpreter, str(index + 1)),
+                               "running": False} for index in range(5)]
+        app.red_monitor = Mock(region=Region(1, 2, 30, 40))
+        app.red_monitor.sound_on_detection = tk.BooleanVar(interpreter, False)
+        app.red_monitor.settings = {"red_threshold": tk.IntVar(interpreter, 190),
+                                    "close_delay": tk.DoubleVar(interpreter, 12.5)}
+        app.yellow_monitor = Mock(region=Region(10, 20, 300, 400))
+        for name, value in (("stall_seconds", 20), ("check_interval", 250),
+                            ("min_yellow_pixels", 15), ("change_percent", 2.5)):
+            setattr(app.yellow_monitor, name, tk.DoubleVar(interpreter, value))
+        app.yellow_monitor.close_on_disappearance = tk.BooleanVar(interpreter, True)
+        app.notebook = Mock()
+        app.notebook.index.return_value = 2
+        app.feature_tabs = Mock()
+        app.feature_tabs.index.return_value = 1
+        app.file_path = None
+        app.events = []
+        app.playing = app.clicking = app.recording = False
+        app._mode_changed = Mock()
+        app.path_label = Mock()
+        app.event_label = Mock()
+        app.play_button = Mock()
+        app.status = Mock()
+        return app
+
+    def test_configuration_round_trip_restores_all_options_without_starting_tasks(self):
+        original = self.make_app()
+        with tempfile.TemporaryDirectory() as folder:
+            recording = Path(folder) / "macro.ksr.json"
+            events = [KeyEvent(0.1, "press", "char", "a")]
+            save_events(recording, events)
+            original.file_path = recording
+            expected = original._configuration()
+            path = Path(folder) / "settings.json"
+            save_configuration(path, expected)
+            restored = self.make_app()
+            for variable in restored._configuration_variables().values():
+                variable.set("0")
+            restored.click_hotkey = frozenset()
+            for slot in restored.auto_key_slots:
+                slot["key"] = None
+            with patch("app.configuration_path", return_value=path), patch("app.messagebox.showwarning") as warning:
+                restored._restore_configuration()
+                warning.assert_not_called()
+            self.assertEqual(restored._configuration()["variables"], expected["variables"])
+            self.assertEqual(restored.click_hotkey, original.click_hotkey)
+            self.assertEqual([slot["key"] for slot in restored.auto_key_slots],
+                             [slot["key"] for slot in original.auto_key_slots])
+            restored.red_monitor._region_selected.assert_called_once_with(original.red_monitor.region)
+            restored.yellow_monitor._region_selected.assert_called_once_with(original.yellow_monitor.region)
+            restored.root.geometry.assert_any_call(expected["geometry"])
+            restored.notebook.select.assert_called_once_with(2)
+            restored.feature_tabs.select.assert_called_once_with(1)
+            self.assertEqual(restored.file_path, recording)
+            self.assertEqual(restored.events, events)
+            self.assertFalse(restored.playing or restored.clicking or restored.recording)
+            self.assertTrue(all(not slot["running"] for slot in restored.auto_key_slots))
+
+    def test_missing_and_corrupt_configuration_do_not_prevent_startup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            for content in (None, "{bad json", "[]"):
+                with self.subTest(content=content):
+                    if content is not None:
+                        path.write_text(content, encoding="utf-8")
+                    app = self.make_app()
+                    with patch("app.configuration_path", return_value=path), patch("app.messagebox.showwarning") as warning:
+                        app._restore_configuration()
+                        self.assertEqual(warning.call_count, 0 if content is None else 1)
+                    self.assertEqual(app.count_var.get(), "27")
+
+    def test_close_saves_before_destroying_and_preserves_file_on_failed_write(self):
+        app = self.make_app()
+        app.stop_all = Mock()
+        app.hotkey_listener = Mock()
+        app.mouse_hotkey_listener = Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            with patch("app.configuration_path", return_value=path):
+                app.close()
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), app._configuration())
+            app.root.destroy.assert_called_once()
+            saved = path.read_bytes()
+            with patch.object(Path, "replace", side_effect=OSError("denied")):
+                with self.assertRaises(OSError):
+                    save_configuration(path, {"new": True})
+            self.assertEqual(path.read_bytes(), saved)
+
+    def test_failed_save_leaves_window_open_for_retry(self):
+        app = self.make_app()
+        app.stop_all = Mock()
+        app.hotkey_listener = Mock()
+        app.mouse_hotkey_listener = Mock()
+        with patch("app.save_configuration", side_effect=OSError("denied")), \
+                patch("app.messagebox.showerror") as error:
+            app.close()
+        app.stop_all.assert_called_once()
+        error.assert_called_once()
+        app.root.destroy.assert_not_called()
+        app.hotkey_listener.stop.assert_not_called()
+
+    def test_unfinished_numeric_entry_is_saved_without_losing_other_settings(self):
+        app = self.make_app()
+        app.yellow_monitor.stall_seconds.set("unfinished")
+        self.assertEqual(app._configuration()["variables"]["yellow_stall_seconds"], "unfinished")
+        self.assertEqual(app._configuration()["variables"]["loop_count"], "27")
 
 
 class StorageTests(unittest.TestCase):

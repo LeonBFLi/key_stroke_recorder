@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -180,6 +181,33 @@ def program_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
+def configuration_path() -> Path:
+    base = os.environ.get("APPDATA") if sys.platform == "win32" else os.environ.get("XDG_CONFIG_HOME")
+    return (Path(base) if base else Path.home() / ".config") / "KeyStrokeRecorder" / "settings.json"
+
+
+def save_configuration(path: Path, settings: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def encode_config_key(key: HotkeyInput) -> dict:
+    if isinstance(key, mouse.Button):
+        return {"device": "mouse", "name": key.name}
+    key_type, value = encode_key(key)
+    return {"device": "keyboard", "key_type": key_type, "value": value}
+
+
+def decode_config_key(data: dict) -> HotkeyInput:
+    if data["device"] == "mouse":
+        return mouse.Button[data["name"]]
+    if data["device"] != "keyboard":
+        raise ValueError("未知配置按键设备")
+    return decode_key(KeyEvent(0, "press", data["key_type"], data["value"]))
+
+
 def save_red_detection_screenshot(image, directory: Path | None = None,
                                   captured_at: datetime | None = None) -> Path:
     """Save the monitored region that caused the close action."""
@@ -286,6 +314,7 @@ class MacroApp:
         root.minsize(680, 520)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._build_ui()
+        self._restore_configuration()
 
         # F8 starts playback while idle and remains an emergency stop while a
         # task is running, even when another program has focus.
@@ -300,6 +329,7 @@ class MacroApp:
 
     def _build_ui(self) -> None:
         notebook = ttk.Notebook(self.root)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True, padx=6, pady=6)
         outer = ttk.Frame(notebook, padding=8)
         monitor_tab = ttk.Frame(notebook, padding=8)
@@ -314,6 +344,7 @@ class MacroApp:
         ttk.Label(outer, text="空闲时 F8 运行录制；任一功能运行时 F8 紧急停止。", foreground="#555").pack(anchor="w", pady=(2, 6))
 
         feature_tabs = ttk.Notebook(outer)
+        self.feature_tabs = feature_tabs
         feature_tabs.pack(fill="both", expand=True)
         macro_tab = ttk.Frame(feature_tabs, padding=8)
         click_tab = ttk.Frame(feature_tabs, padding=8)
@@ -847,8 +878,91 @@ class MacroApp:
         self.red_monitor.stop(silent=True)
         self.yellow_monitor.stop(silent=True)
 
+    def _configuration_variables(self) -> dict[str, tk.Variable]:
+        variables = {"loop_mode": self.loop_mode, "loop_count": self.count_var,
+                     "click_rate": self.click_rate_var,
+                     "red_sound": self.red_monitor.sound_on_detection}
+        variables.update({f"red_{key}": value for key, value in self.red_monitor.settings.items()})
+        variables.update({f"yellow_{key}": getattr(self.yellow_monitor, key) for key in
+                          ("stall_seconds", "check_interval", "min_yellow_pixels", "change_percent", "close_on_disappearance")})
+        variables.update({f"auto_interval_{index}": slot["interval_var"]
+                          for index, slot in enumerate(self.auto_key_slots)})
+        return variables
+
+    def _configuration(self) -> dict:
+        return {
+            "version": 1,
+            # Read raw entry text so an unfinished numeric edit can still be saved.
+            "variables": {name: str(self.root.globalgetvar(str(var)))
+                          for name, var in self._configuration_variables().items()},
+            "click_hotkey": [encode_config_key(key) for key in self.click_hotkey],
+            "auto_keys": [encode_config_key(slot["key"]) if slot["key"] is not None else None
+                          for slot in self.auto_key_slots],
+            "red_region": asdict(self.red_monitor.region) if self.red_monitor.region else None,
+            "yellow_region": asdict(self.yellow_monitor.region) if self.yellow_monitor.region else None,
+            "file_path": str(self.file_path) if self.file_path else None,
+            "geometry": self.root.geometry(),
+            "tab": self.notebook.index("current"),
+            "feature_tab": self.feature_tabs.index("current"),
+        }
+
+    def _restore_configuration(self) -> None:
+        path = configuration_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("version") != 1:
+                raise ValueError("不支持的配置文件")
+            # Decode structural values before applying any configuration.
+            keys = frozenset(decode_config_key(item) for item in data["click_hotkey"])
+            if not keys or keyboard.Key.f8 in keys or mouse.Button.left in keys:
+                raise ValueError("配置中的连点热键无效")
+            auto_keys = [decode_config_key(item) if item else None for item in data["auto_keys"]]
+            if len(auto_keys) != 5 or any(isinstance(key, mouse.Button) or key == keyboard.Key.f8
+                                          for key in auto_keys if key is not None):
+                raise ValueError("配置中的定时按键无效")
+            regions = []
+            for name in ("red_region", "yellow_region"):
+                region = Region(**data[name]) if data.get(name) else None
+                if region and (region.width <= 0 or region.height <= 0):
+                    raise ValueError("配置中的监控区域无效")
+                regions.append(region)
+            for name, variable in self._configuration_variables().items():
+                if name in data["variables"]:
+                    variable.set(data["variables"][name])
+            self.click_hotkey = keys
+            self.click_hotkey_var.set(format_hotkey(keys))
+            for slot, key in zip(self.auto_key_slots, auto_keys):
+                slot["key"] = key
+                slot["key_var"].set(format_hotkey(frozenset({key})) if key is not None else "未设置")
+            for panel, region in zip((self.red_monitor, self.yellow_monitor), regions):
+                if region:
+                    panel._region_selected(region)
+            self._mode_changed()
+            if data.get("geometry"):
+                self.root.geometry(data["geometry"])
+            self.notebook.select(data.get("tab", 0))
+            self.feature_tabs.select(data.get("feature_tab", 0))
+            if data.get("file_path"):
+                self.file_path = Path(data["file_path"])
+                self.path_label.configure(text=str(self.file_path))
+                try:
+                    self.events = load_events(self.file_path)
+                    self.event_label.configure(text=f"已加载 {len(self.events)} 个事件")
+                    self.play_button.configure(state="normal" if self.events else "disabled")
+                except (OSError, ValueError, TypeError, KeyError):
+                    self.status.set("已恢复配置，但上次的录制文件无法加载，请重新选择。")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, tk.TclError) as exc:
+            messagebox.showwarning("配置恢复失败", f"无法完整恢复上次的配置：{exc}")
+
     def close(self) -> None:
         self.stop_all()
+        try:
+            save_configuration(configuration_path(), self._configuration())
+        except (OSError, ValueError, tk.TclError) as exc:
+            messagebox.showerror("配置保存失败", f"设置未保存：{exc}\n请检查配置目录权限后再次关闭程序。")
+            return
         self.hotkey_listener.stop()
         self.mouse_hotkey_listener.stop()
         self.root.destroy()
@@ -1168,6 +1282,7 @@ class YellowStabilityMonitorPanel:
         self.check_interval = tk.IntVar(value=250)
         self.min_yellow_pixels = tk.IntVar(value=8)
         self.change_percent = tk.DoubleVar(value=1.0)
+        self.close_on_disappearance = tk.BooleanVar(value=False)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1187,16 +1302,18 @@ class YellowStabilityMonitorPanel:
             row, pair = 3 + index // 2, index % 2
             ttk.Label(self.parent, text=label).grid(row=row, column=pair * 2, sticky="w", pady=7)
             ttk.Entry(self.parent, textvariable=variable, width=10).grid(row=row, column=pair * 2 + 1, sticky="w")
+        ttk.Checkbutton(self.parent, text="已追踪的黄色进度条消失时立即关闭窗口",
+                        variable=self.close_on_disappearance).grid(row=5, column=0, columnspan=4, sticky="w")
         buttons = ttk.Frame(self.parent)
-        buttons.grid(row=5, column=0, columnspan=4, sticky="w", pady=8)
+        buttons.grid(row=6, column=0, columnspan=4, sticky="w", pady=8)
         self.start_button = ttk.Button(buttons, text="开始监控", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止监控", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="状态：待机")
-        ttk.Label(self.parent, textvariable=self.status).grid(row=6, column=0, columnspan=4, sticky="w")
+        ttk.Label(self.parent, textvariable=self.status).grid(row=7, column=0, columnspan=4, sticky="w")
         ttk.Label(self.parent, text="提示：区域尽量只包含进度条和数字；动态背景会被视为变化。",
-                  foreground="#666").grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
+                  foreground="#666").grid(row=8, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
     def select_region(self) -> None:
         RegionSelector(self.root, self._region_selected)
@@ -1206,9 +1323,9 @@ class YellowStabilityMonitorPanel:
         self.region_label.configure(
             text=f"({region.left}, {region.top})–({region.right}, {region.bottom})，{region.width}×{region.height}")
 
-    def _settings(self) -> tuple[float, int, int, float]:
+    def _settings(self) -> tuple[float, int, int, float, bool]:
         values = (self.stall_seconds.get(), self.check_interval.get(),
-                  self.min_yellow_pixels.get(), self.change_percent.get())
+                  self.min_yellow_pixels.get(), self.change_percent.get(), self.close_on_disappearance.get())
         if values[0] <= 0 or values[1] < 50 or values[2] < 1 or not 0 <= values[3] <= 100:
             raise ValueError("无变化秒数须大于 0，间隔至少 50 ms，黄色像素至少 1，容差须为 0–100%。")
         return values
@@ -1243,10 +1360,11 @@ class YellowStabilityMonitorPanel:
         self.stop_button.configure(state="disabled")
         self.status.set("状态：已停止" if not silent else "状态：待机")
 
-    def _monitor(self, region: Region, settings: tuple[float, int, int, float]) -> None:
-        stall_seconds, interval, min_yellow, tolerance = settings
+    def _monitor(self, region: Region, settings: tuple[float, int, int, float, bool]) -> None:
+        stall_seconds, interval, min_yellow, tolerance, close_on_disappearance = settings
         previous: bytes | None = None
         unchanged_since: float | None = None
+        tracking = False
         try:
             while not self.stop_event.is_set():
                 image = ImageGrab.grab(bbox=(region.left, region.top, region.right, region.bottom))
@@ -1254,6 +1372,9 @@ class YellowStabilityMonitorPanel:
                 now = time.monotonic()
                 unchanged = previous is not None and signature_difference(previous, signature) <= tolerance / 100
                 if yellow_count < min_yellow:
+                    if tracking and close_on_disappearance:
+                        self.root.after(0, lambda: self._close_foreground_window(disappeared=True))
+                        return
                     unchanged_since = None
                     self.root.after(0, lambda: self.status.set("状态：区域内未检测到足够的黄色进度条"))
                 elif not unchanged:
@@ -1268,11 +1389,12 @@ class YellowStabilityMonitorPanel:
                     self.root.after(0, lambda seconds=remaining: self.status.set(
                         f"状态：画面未变化，{seconds:.1f} 秒后关闭当前窗口"))
                 previous = signature
+                tracking = tracking or yellow_count >= min_yellow
                 self.stop_event.wait(interval / 1000)
         except Exception as exc:
             self.root.after(0, lambda error=exc: self._failed(error))
 
-    def _close_foreground_window(self) -> None:
+    def _close_foreground_window(self, disappeared: bool = False) -> None:
         if not self.running or self.stop_event.is_set():
             return
         self.on_close_trigger()
@@ -1284,7 +1406,8 @@ class YellowStabilityMonitorPanel:
             if not hwnd:
                 raise RuntimeError("未找到前台窗口")
             ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
-            self.status.set("状态：黄色进度条和数字长时间未变化，已发送关闭指令")
+            self.status.set("状态：已追踪的黄色进度条消失，已发送关闭指令" if disappeared
+                            else "状态：黄色进度条和数字长时间未变化，已发送关闭指令")
         except Exception as exc:  # pragma: no cover - depends on the Windows desktop
             self.status.set(f"状态：关闭当前窗口失败：{exc}")
         finally:
