@@ -43,6 +43,9 @@ class MonitorActionTests(unittest.TestCase):
         panel.status = Mock()
         panel._log = Mock()
         panel.sound_on_detection = Mock(get=Mock(return_value=False))
+        panel.region = Region(10, 20, 110, 120)
+        panel.on_before_close = Mock(return_value=Path("captured.png"))
+        panel.on_state_change = Mock()
         return panel
 
     def test_yellow_disappearance_only_closes_after_tracking_when_enabled(self):
@@ -148,6 +151,74 @@ class MonitorActionTests(unittest.TestCase):
                     sound.assert_called_once_with(panel.root)
                     user32.PostMessageW.assert_not_called()
 
+    def test_all_monitor_triggers_capture_after_stopping_and_before_close(self):
+        for panel_class, disappeared, source in (
+                (RedMonitorPanel, False, "red_dot_detection"),
+                (YellowStabilityMonitorPanel, False, "yellow_stall"),
+                (YellowStabilityMonitorPanel, True, "yellow_disappeared")):
+            with self.subTest(source=source):
+                panel = self.make_panel(panel_class)
+                order = []
+                panel.on_close_trigger = Mock(side_effect=lambda: order.append("stop_all"))
+
+                def capture(reason, region):
+                    self.assertEqual(reason, source)
+                    self.assertEqual(region, panel.region)
+                    self.assertFalse(panel.running)
+                    self.assertTrue(panel.stop_event.is_set())
+                    order.append("screenshot")
+                    return Path("captured.png")
+
+                panel.on_before_close.side_effect = capture
+                user32 = Mock()
+                user32.GetForegroundWindow.return_value = 123
+                user32.PostMessageW.side_effect = lambda *_args: order.append("close")
+                with patch("ctypes.windll", Mock(user32=user32), create=True), \
+                        patch("app.play_notification_sound"):
+                    if disappeared:
+                        panel._close_foreground_window(disappeared=True)
+                    else:
+                        panel._close_foreground_window()
+                self.assertEqual(order, ["stop_all", "screenshot", "close"])
+                panel.on_before_close.assert_called_once_with(source, panel.region)
+
+    def test_screenshot_failure_does_not_skip_close_and_alert(self):
+        for panel_class in (RedMonitorPanel, YellowStabilityMonitorPanel):
+            with self.subTest(trigger=panel_class.__name__):
+                panel = self.make_panel(panel_class)
+                panel.on_close_trigger = Mock()
+                panel.on_before_close.side_effect = OSError("disk full")
+                user32 = Mock()
+                user32.GetForegroundWindow.return_value = 123
+                with patch("ctypes.windll", Mock(user32=user32), create=True), \
+                        patch("app.play_notification_sound") as sound:
+                    panel._close_foreground_window()
+                self.assertFalse(panel.running)
+                self.assertTrue(panel.stop_event.is_set())
+                panel.on_close_trigger.assert_called_once()
+                user32.PostMessageW.assert_called_once_with(123, 0x0010, 0, 0)
+                sound.assert_called_once_with(panel.root)
+                reported = str(panel._log.call_args_list) + str(panel.status.set.call_args_list)
+                self.assertIn("disk full", reported)
+
+    def test_monitor_close_captures_active_region_after_new_selection(self):
+        for panel_class, source in ((RedMonitorPanel, "red_dot_detection"),
+                                    (YellowStabilityMonitorPanel, "yellow_stall")):
+            with self.subTest(trigger=panel_class.__name__):
+                panel = self.make_panel(panel_class)
+                panel.on_close_trigger = Mock()
+                panel.active_region = Region(0, 0, 50, 50)
+                # A new selection configures the next run; the current worker
+                # still detects against the region captured when it started.
+                panel.region = Region(200, 200, 300, 300)
+                user32 = Mock()
+                user32.GetForegroundWindow.return_value = 123
+                with patch("ctypes.windll", Mock(user32=user32), create=True), \
+                        patch("app.play_notification_sound"):
+                    panel._close_foreground_window()
+                panel.on_before_close.assert_called_once_with(source, panel.active_region)
+                user32.PostMessageW.assert_called_once_with(123, 0x0010, 0, 0)
+
 
 class ConfigurationTests(unittest.TestCase):
     def make_app(self):
@@ -158,6 +229,8 @@ class ConfigurationTests(unittest.TestCase):
         app.root.geometry.return_value = "820x620+20+30"
         app.loop_mode = tk.StringVar(interpreter, "forever")
         app.count_var = tk.StringVar(interpreter, "27")
+        app.run_red_monitor = tk.BooleanVar(interpreter, True)
+        app.run_yellow_monitor = tk.BooleanVar(interpreter, False)
         app.click_rate_var = tk.StringVar(interpreter, "18.5")
         app.click_hotkey = frozenset({keyboard.KeyCode.from_char("c"), mouse.Button.right})
         app.click_hotkey_var = tk.StringVar(interpreter)
@@ -174,6 +247,8 @@ class ConfigurationTests(unittest.TestCase):
                             ("min_yellow_pixels", 15), ("change_percent", 2.5)):
             setattr(app.yellow_monitor, name, tk.DoubleVar(interpreter, value))
         app.yellow_monitor.close_on_disappearance = tk.BooleanVar(interpreter, True)
+        app.screenshot_panel = Mock(region=Region(20, 30, 400, 500),
+                                    directory=Path("custom-captures"))
         app.notebook = Mock()
         app.notebook.index.return_value = 2
         app.feature_tabs = Mock()
@@ -185,7 +260,9 @@ class ConfigurationTests(unittest.TestCase):
         app.path_label = Mock()
         app.event_label = Mock()
         app.play_button = Mock()
+        app.combined_run_button = Mock()
         app.status = Mock()
+        app._refresh_monitor_status = Mock()
         return app
 
     def test_configuration_round_trip_restores_all_options_without_starting_tasks(self):
@@ -204,7 +281,9 @@ class ConfigurationTests(unittest.TestCase):
             restored.click_hotkey = frozenset()
             for slot in restored.auto_key_slots:
                 slot["key"] = None
-            with patch("app.configuration_path", return_value=path), patch("app.messagebox.showwarning") as warning:
+            with patch("app.configuration_path", return_value=path), \
+                    patch("app.fit_window_geometry") as fit_geometry, \
+                    patch("app.messagebox.showwarning") as warning:
                 restored._restore_configuration()
                 warning.assert_not_called()
             self.assertEqual(restored._configuration()["variables"], expected["variables"])
@@ -213,13 +292,35 @@ class ConfigurationTests(unittest.TestCase):
                              [slot["key"] for slot in original.auto_key_slots])
             restored.red_monitor._region_selected.assert_called_once_with(original.red_monitor.region)
             restored.yellow_monitor._region_selected.assert_called_once_with(original.yellow_monitor.region)
-            restored.root.geometry.assert_any_call(expected["geometry"])
+            fit_geometry.assert_called_once_with(restored.root, expected["geometry"])
+            restored.screenshot_panel._region_selected.assert_called_once_with(original.screenshot_panel.region)
+            restored.screenshot_panel.set_directory.assert_called_once_with(original.screenshot_panel.directory)
             restored.notebook.select.assert_called_once_with(2)
             restored.feature_tabs.select.assert_called_once_with(1)
             self.assertEqual(restored.file_path, recording)
             self.assertEqual(restored.events, events)
             self.assertFalse(restored.playing or restored.clicking or restored.recording)
             self.assertTrue(all(not slot["running"] for slot in restored.auto_key_slots))
+
+    def test_old_configuration_keeps_screenshot_and_combined_defaults(self):
+        original = self.make_app()
+        previous = original._configuration()
+        previous.pop("screenshot_region", None)
+        previous.pop("screenshot_directory", None)
+        previous["variables"].pop("run_red_monitor", None)
+        previous["variables"].pop("run_yellow_monitor", None)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            save_configuration(path, previous)
+            restored = self.make_app()
+            with patch("app.configuration_path", return_value=path), \
+                    patch("app.fit_window_geometry"), patch("app.messagebox.showwarning") as warning:
+                restored._restore_configuration()
+            warning.assert_not_called()
+            restored.screenshot_panel._region_selected.assert_not_called()
+            restored.screenshot_panel.set_directory.assert_not_called()
+            self.assertTrue(restored.run_red_monitor.get())
+            self.assertFalse(restored.run_yellow_monitor.get())
 
     def test_missing_and_corrupt_configuration_do_not_prevent_startup(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -358,7 +459,10 @@ class StorageTests(unittest.TestCase):
         # Mock only its platform parser while exercising our validation logic.
         with patch("app.keyboard.HotKey.parse", return_value=[keyboard.KeyCode.from_vk(1)]):
             self.assertTrue(parse_hotkey("<ctrl>+<alt>+c"))
-        for value in ("", "<f8>", "<not-a-key>"):
+        with patch("app.keyboard.HotKey.parse", return_value=[keyboard.Key.f8]):
+            with self.assertRaises(ValueError):
+                parse_hotkey("<f8>")
+        for value in ("", "<not-a-key>"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_hotkey(value)
 
