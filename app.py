@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -211,9 +212,16 @@ def decode_config_key(data: dict) -> HotkeyInput:
 def save_red_detection_screenshot(image, directory: Path | None = None,
                                   captured_at: datetime | None = None) -> Path:
     """Save the monitored region that caused the close action."""
-    destination = directory or program_directory()
+    return save_monitor_screenshot(image, "red_dot_detection", directory or program_directory(), captured_at)
+
+
+def save_monitor_screenshot(image, source: str, directory: Path,
+                            captured_at: datetime | None = None) -> Path:
+    """Write a PNG named for its trigger, creating the destination if necessary."""
+    destination = Path(directory)
+    destination.mkdir(parents=True, exist_ok=True)
     timestamp = (captured_at or datetime.now()).strftime("%Y%m%d_%H%M%S_%f")
-    path = destination / f"red_dot_detection_{timestamp}.png"
+    path = destination / f"{source}_{timestamp}.png"
     image.save(path, format="PNG")
     return path
 
@@ -286,6 +294,93 @@ def play_notification_sound(root: tk.Misc) -> None:
         root.bell()
 
 
+def fit_window_geometry(root: tk.Tk, geometry: str | None = None) -> None:
+    """Keep both new and restored windows inside the current desktop work area."""
+    match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)?([+-]\d+)?", geometry or "720x500")
+    if not match:
+        match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)?([+-]\d+)?", "720x500")
+    width, height = int(match[1]), int(match[2])
+    left, top = 0, 0
+    right, bottom = root.winfo_screenwidth(), root.winfo_screenheight()
+    x, y = int(match[3] or 20), int(match[4] or 20)
+    if match[3] and match[3].startswith("-"):
+        x = right - width + x
+    if match[4] and match[4].startswith("-"):
+        y = bottom - height + y
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            user32.MonitorFromRect.restype = wintypes.HANDLE
+            user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+            desired = wintypes.RECT(x, y, x + width, y + height)
+            monitor = user32.MonitorFromRect(ctypes.byref(desired), 2)
+            info = MonitorInfo()
+            info.cbSize = ctypes.sizeof(info)
+            if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                left, top, right, bottom = (info.rcWork.left, info.rcWork.top,
+                                            info.rcWork.right, info.rcWork.bottom)
+        except (AttributeError, OSError):
+            pass
+    # Leave room for the window border and title bar, including desktop scaling.
+    margin_x = max(16, int(root.winfo_fpixels("0.17i")))
+    margin_y = max(48, int(root.winfo_fpixels("0.5i")))
+    available_width = max(1, right - left - margin_x)
+    available_height = max(1, bottom - top - margin_y)
+    width = min(max(480, width), available_width)
+    height = min(max(320, height), available_height)
+    x = min(max(left, x), right - width - margin_x)
+    y = min(max(top, y), bottom - height - margin_y)
+    root.minsize(min(480, available_width), min(320, available_height))
+    # Tk treats negative positions as distances from the far edge. Calculate
+    # offsets so monitors to the left/above the primary display remain usable.
+    x_position = f"+{x}" if x >= 0 else f"-{root.winfo_screenwidth() - x - width}"
+    y_position = f"+{y}" if y >= 0 else f"-{root.winfo_screenheight() - y - height}"
+    root.geometry(f"{width}x{height}{x_position}{y_position}")
+
+
+class ScrollableFrame(ttk.Frame):
+    """Allow every settings page to remain reachable on small displays."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        vertical = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        horizontal = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.content = ttk.Frame(self.canvas, padding=4)
+        self.window = self.canvas.create_window(0, 0, window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._resize)
+        self.canvas.bind("<Configure>", self._resize)
+        # Bind at the toplevel, but handle only events belonging to this page.
+        self.winfo_toplevel().bind("<MouseWheel>", self._mousewheel, add="+")
+        self.winfo_toplevel().bind("<Button-4>", self._mousewheel, add="+")
+        self.winfo_toplevel().bind("<Button-5>", self._mousewheel, add="+")
+
+    def _resize(self, _event=None) -> None:
+        self.canvas.itemconfigure(self.window, width=max(self.canvas.winfo_width(), self.content.winfo_reqwidth()))
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _mousewheel(self, event) -> None:
+        widget = event.widget
+        while widget is not None and widget is not self:
+            widget = getattr(widget, "master", None)
+        if widget is self:
+            direction = -1 if getattr(event, "num", None) == 4 or event.delta > 0 else 1
+            self.canvas.yview_scroll(direction * 3, "units")
+
+
 class MacroApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -310,11 +405,11 @@ class MacroApp:
         self.capturing_auto_key: int | None = None
 
         root.title(APP_NAME)
-        root.geometry("820x620")
-        root.minsize(680, 520)
+        fit_window_geometry(root)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._build_ui()
         self._restore_configuration()
+        self._refresh_monitor_status()
 
         # F8 starts playback while idle and remains an emergency stop while a
         # task is running, even when another program has focus.
@@ -330,30 +425,32 @@ class MacroApp:
     def _build_ui(self) -> None:
         notebook = ttk.Notebook(self.root)
         self.notebook = notebook
-        notebook.pack(fill="both", expand=True, padx=6, pady=6)
-        outer = ttk.Frame(notebook, padding=8)
-        monitor_tab = ttk.Frame(notebook, padding=8)
-        yellow_tab = ttk.Frame(notebook, padding=8)
-        notebook.add(outer, text="宏与自动操作")
-        notebook.add(monitor_tab, text="红点监控")
-        notebook.add(yellow_tab, text="黄色进度监控")
-        self.red_monitor = RedMonitorPanel(monitor_tab, on_close_trigger=self.stop_all)
-        self.yellow_monitor = YellowStabilityMonitorPanel(yellow_tab, on_close_trigger=self.stop_all)
+        notebook.pack(fill="both", expand=True, padx=3, pady=3)
+        pages = [ScrollableFrame(notebook) for _ in range(4)]
+        outer, monitor_tab, yellow_tab, screenshot_tab = [page.content for page in pages]
+        for page, title in zip(pages, ("宏与自动操作", "红点监控", "黄色进度监控", "屏幕截图")):
+            notebook.add(page, text=title)
+        self.screenshot_panel = ScreenshotPanel(screenshot_tab)
+        self.red_monitor = RedMonitorPanel(monitor_tab, on_close_trigger=self.stop_all,
+                                          on_before_close=self.screenshot_panel.capture_trigger,
+                                          on_state_change=self._refresh_monitor_status)
+        self.yellow_monitor = YellowStabilityMonitorPanel(yellow_tab, on_close_trigger=self.stop_all,
+                                          on_before_close=self.screenshot_panel.capture_trigger,
+                                          on_state_change=self._refresh_monitor_status)
 
-        ttk.Label(outer, text="宏与自动操作", font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="空闲时 F8 运行录制；任一功能运行时 F8 紧急停止。", foreground="#555").pack(anchor="w", pady=(2, 6))
+        ttk.Label(outer, text="空闲时 F8 运行录制；运行中 F8 停止全部任务。", foreground="#555").pack(anchor="w", pady=(0, 3))
 
         feature_tabs = ttk.Notebook(outer)
         self.feature_tabs = feature_tabs
         feature_tabs.pack(fill="both", expand=True)
-        macro_tab = ttk.Frame(feature_tabs, padding=8)
-        click_tab = ttk.Frame(feature_tabs, padding=8)
-        auto_tab = ttk.Frame(feature_tabs, padding=8)
+        macro_tab = ttk.Frame(feature_tabs, padding=4)
+        click_tab = ttk.Frame(feature_tabs, padding=4)
+        auto_tab = ttk.Frame(feature_tabs, padding=4)
         feature_tabs.add(macro_tab, text="录制 / 回放")
         feature_tabs.add(click_tab, text="鼠标连点")
         feature_tabs.add(auto_tab, text="定时按键")
 
-        record_box = ttk.LabelFrame(macro_tab, text="录制", padding=8)
+        record_box = ttk.LabelFrame(macro_tab, text="录制", padding=4)
         record_box.pack(fill="x")
         self.record_button = ttk.Button(record_box, text="开始录制", command=self.toggle_recording)
         self.record_button.pack(side="left")
@@ -362,20 +459,35 @@ class MacroApp:
         self.event_label = ttk.Label(record_box, text="尚未录制")
         self.event_label.pack(side="left", padx=10)
 
-        play_box = ttk.LabelFrame(macro_tab, text="回放", padding=8)
-        play_box.pack(fill="x", pady=(8, 0))
+        play_box = ttk.LabelFrame(macro_tab, text="回放", padding=4)
+        play_box.pack(fill="x", pady=(4, 0))
         ttk.Button(play_box, text="选择录制文件…", command=self.open_file).grid(row=0, column=0, padx=(0, 8))
-        self.path_label = ttk.Label(play_box, text="未选择文件")
+        self.path_label = ttk.Label(play_box, text="未选择文件", wraplength=360)
         self.path_label.grid(row=0, column=1, columnspan=4, sticky="w")
-        ttk.Label(play_box, text="循环方式：").grid(row=1, column=0, sticky="e", pady=(14, 0))
+        ttk.Label(play_box, text="循环方式：").grid(row=1, column=0, sticky="e", pady=(5, 0))
         self.loop_mode = tk.StringVar(value="count")
-        ttk.Radiobutton(play_box, text="指定次数", variable=self.loop_mode, value="count", command=self._mode_changed).grid(row=1, column=1, pady=(14, 0))
+        ttk.Radiobutton(play_box, text="指定次数", variable=self.loop_mode, value="count", command=self._mode_changed).grid(row=1, column=1, pady=(5, 0))
         self.count_var = tk.StringVar(value="1")
         self.count_spin = ttk.Spinbox(play_box, from_=1, to=9999, width=7, textvariable=self.count_var)
-        self.count_spin.grid(row=1, column=2, pady=(14, 0), padx=(4, 12))
-        ttk.Radiobutton(play_box, text="一直循环，直到停止", variable=self.loop_mode, value="forever", command=self._mode_changed).grid(row=1, column=3, pady=(14, 0))
-        self.play_button = ttk.Button(play_box, text="开始运行", command=self.toggle_playback, state="disabled")
-        self.play_button.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        self.count_spin.grid(row=1, column=2, pady=(5, 0), padx=(4, 6))
+        ttk.Radiobutton(play_box, text="一直循环", variable=self.loop_mode, value="forever", command=self._mode_changed).grid(row=1, column=3, pady=(5, 0))
+        controls = ttk.Frame(play_box)
+        controls.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.play_button = ttk.Button(controls, text="开始运行", command=self.toggle_playback, state="disabled")
+        self.play_button.pack(side="left")
+        self.combined_run_button = ttk.Button(controls, text="运行录制并启动监控", command=self.start_with_monitors,
+                                              state="disabled")
+        self.combined_run_button.pack(side="left", padx=5)
+        indicators = ttk.Frame(play_box)
+        indicators.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.run_red_monitor = tk.BooleanVar(value=True)
+        self.run_yellow_monitor = tk.BooleanVar(value=True)
+        ttk.Checkbutton(indicators, text="联动红点", variable=self.run_red_monitor).pack(side="left")
+        self.red_monitor_indicator = ttk.Label(indicators, text="红点：未设置", foreground="#777")
+        self.red_monitor_indicator.pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(indicators, text="联动黄色", variable=self.run_yellow_monitor).pack(side="left")
+        self.yellow_monitor_indicator = ttk.Label(indicators, text="黄色：未设置", foreground="#777")
+        self.yellow_monitor_indicator.pack(side="left")
         play_box.columnconfigure(1, weight=1)
 
         click_box = ttk.LabelFrame(click_tab, text="鼠标连点", padding=8)
@@ -428,6 +540,63 @@ class MacroApp:
         ttk.Label(status_box, textvariable=self.status, wraplength=570).pack(anchor="w")
         self.progress = ttk.Progressbar(status_box, mode="indeterminate")
         self.progress.pack(fill="x", pady=(4, 0))
+
+    def _refresh_monitor_status(self) -> None:
+        for panel, indicator, name in ((self.red_monitor, self.red_monitor_indicator, "红点"),
+                                       (self.yellow_monitor, self.yellow_monitor_indicator, "黄色")):
+            state = "已激活" if panel.running else ("未激活" if panel.region else "未设置")
+            indicator.configure(text=f"{name}：{state}", foreground="#16803a" if panel.running else "#777")
+
+    def start_with_monitors(self) -> None:
+        if self.playing:
+            self.stop_all()
+            return
+        if self.recording or not self.events:
+            messagebox.showwarning("无法运行", "请先停止录制，并录制或加载键盘鼠标记录。")
+            return
+        selected = []
+        try:
+            # Validate the whole request before starting any new task.
+            self._playback_count()
+            for enabled, panel, name in ((self.run_red_monitor.get(), self.red_monitor, "红点"),
+                                          (self.run_yellow_monitor.get(), self.yellow_monitor, "黄色进度")):
+                if not enabled or panel.running:
+                    continue
+                if panel.region is None:
+                    raise ValueError(f"请先设置{name}监控区域，或取消对应的联动勾选。")
+                if ImageGrab is None:
+                    raise ValueError("画面监控需要 Pillow，请重新运行 run.bat 安装依赖。")
+                if panel is self.red_monitor:
+                    panel._validated_settings()
+                else:
+                    panel._settings()
+                selected.append(panel)
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showwarning("运行设置无效", str(exc))
+            return
+        started = []
+        try:
+            for panel in selected:
+                if not panel.start():
+                    return
+                started.append(panel)
+            self.toggle_playback()
+        finally:
+            if not self.playing:
+                for panel in started:
+                    panel.stop()
+            self._refresh_monitor_status()
+
+    def _playback_count(self) -> int | None:
+        if self.loop_mode.get() == "forever":
+            return None
+        try:
+            count = int(self.count_var.get())
+            if not 1 <= count <= 9999:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("请输入 1 到 9999 之间的整数。") from exc
+        return count
 
     def start_hotkey_capture(self) -> None:
         """Arm global listeners to learn the next complete keyboard/mouse chord."""
@@ -582,6 +751,7 @@ class MacroApp:
         self.record_button.configure(text="停止录制")
         self.save_button.configure(state="disabled")
         self.play_button.configure(state="disabled")
+        self.combined_run_button.configure(state="disabled")
         self.mouse_record_listener = mouse.Listener(on_move=self._capture_mouse_move,
                                                     on_click=self._capture_mouse_click)
         self.mouse_record_listener.start()
@@ -640,6 +810,7 @@ class MacroApp:
         self.record_button.configure(text="开始录制")
         self.save_button.configure(state="normal" if self.events else "disabled")
         self.play_button.configure(state="normal" if self.events else "disabled")
+        self.combined_run_button.configure(state="normal" if self.events else "disabled")
         self.progress.stop()
         self.status.set(f"录制完成，共 {len(self.events)} 个键盘和鼠标事件。请保存录制。")
 
@@ -670,6 +841,7 @@ class MacroApp:
         self.path_label.configure(text=str(self.file_path))
         self.event_label.configure(text=f"已加载 {len(self.events)} 个事件")
         self.play_button.configure(state="normal" if self.events else "disabled")
+        self.combined_run_button.configure(state="normal" if self.events else "disabled")
         self.status.set("录制文件已加载，可以开始运行。")
 
     def toggle_playback(self) -> None:
@@ -679,20 +851,18 @@ class MacroApp:
             return
         if not self.events or self.recording:
             return
-        forever = self.loop_mode.get() == "forever"
         try:
-            count = int(self.count_var.get())
-            if not 1 <= count <= 9999:
-                raise ValueError
-        except ValueError:
-            messagebox.showwarning("循环次数无效", "请输入 1 到 9999 之间的整数。")
+            count = self._playback_count()
+        except ValueError as exc:
+            messagebox.showwarning("循环次数无效", str(exc))
             return
         self.playing = True
         self.stop_playback.clear()
         self.play_button.configure(text="停止运行")
+        self.combined_run_button.configure(text="停止全部任务")
         self.record_button.configure(state="disabled")
         self.progress.start(12)
-        threading.Thread(target=self._play_worker, args=(None if forever else count,), daemon=True).start()
+        threading.Thread(target=self._play_worker, args=(count,), daemon=True).start()
 
     def _play_worker(self, loops: int | None) -> None:
         key_controller = keyboard.Controller()
@@ -856,6 +1026,7 @@ class MacroApp:
         self.playing = False
         self.progress.stop()
         self.play_button.configure(text="开始运行", state="normal")
+        self.combined_run_button.configure(text="运行录制并启动监控", state="normal")
         self.record_button.configure(state="normal")
         if error:
             messagebox.showerror("运行失败", str(error))
@@ -881,6 +1052,8 @@ class MacroApp:
     def _configuration_variables(self) -> dict[str, tk.Variable]:
         variables = {"loop_mode": self.loop_mode, "loop_count": self.count_var,
                      "click_rate": self.click_rate_var,
+                     "run_red_monitor": self.run_red_monitor,
+                     "run_yellow_monitor": self.run_yellow_monitor,
                      "red_sound": self.red_monitor.sound_on_detection}
         variables.update({f"red_{key}": value for key, value in self.red_monitor.settings.items()})
         variables.update({f"yellow_{key}": getattr(self.yellow_monitor, key) for key in
@@ -900,6 +1073,8 @@ class MacroApp:
                           for slot in self.auto_key_slots],
             "red_region": asdict(self.red_monitor.region) if self.red_monitor.region else None,
             "yellow_region": asdict(self.yellow_monitor.region) if self.yellow_monitor.region else None,
+            "screenshot_region": asdict(self.screenshot_panel.region) if self.screenshot_panel.region else None,
+            "screenshot_directory": str(self.screenshot_panel.directory),
             "file_path": str(self.file_path) if self.file_path else None,
             "geometry": self.root.geometry(),
             "tab": self.notebook.index("current"),
@@ -921,7 +1096,7 @@ class MacroApp:
                                           for key in auto_keys if key is not None):
                 raise ValueError("配置中的定时按键无效")
             regions = []
-            for name in ("red_region", "yellow_region"):
+            for name in ("red_region", "yellow_region", "screenshot_region"):
                 region = Region(**data[name]) if data.get(name) else None
                 if region and (region.width <= 0 or region.height <= 0):
                     raise ValueError("配置中的监控区域无效")
@@ -934,12 +1109,14 @@ class MacroApp:
             for slot, key in zip(self.auto_key_slots, auto_keys):
                 slot["key"] = key
                 slot["key_var"].set(format_hotkey(frozenset({key})) if key is not None else "未设置")
-            for panel, region in zip((self.red_monitor, self.yellow_monitor), regions):
+            for panel, region in zip((self.red_monitor, self.yellow_monitor, self.screenshot_panel), regions):
                 if region:
                     panel._region_selected(region)
+            if data.get("screenshot_directory"):
+                self.screenshot_panel.set_directory(Path(data["screenshot_directory"]))
             self._mode_changed()
             if data.get("geometry"):
-                self.root.geometry(data["geometry"])
+                fit_window_geometry(self.root, data["geometry"])
             self.notebook.select(data.get("tab", 0))
             self.feature_tabs.select(data.get("feature_tab", 0))
             if data.get("file_path"):
@@ -949,6 +1126,7 @@ class MacroApp:
                     self.events = load_events(self.file_path)
                     self.event_label.configure(text=f"已加载 {len(self.events)} 个事件")
                     self.play_button.configure(state="normal" if self.events else "disabled")
+                    self.combined_run_button.configure(state="normal" if self.events else "disabled")
                 except (OSError, ValueError, TypeError, KeyError):
                     self.status.set("已恢复配置，但上次的录制文件无法加载，请重新选择。")
         except FileNotFoundError:
@@ -1054,10 +1232,81 @@ def count_red_blob_pixels(image, red_threshold: int, delta_threshold: int, green
     return valid_count
 
 
+class ScreenshotPanel:
+    """Configure a shared capture area for manual and monitor-triggered images."""
+
+    def __init__(self, parent: ttk.Frame) -> None:
+        self.parent = parent
+        self.root = parent.winfo_toplevel()
+        self.region: Region | None = None
+        self.directory = program_directory() / "screenshots"
+        ttk.Label(parent, text="屏幕截图", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(parent, text="监控触发关闭前自动保存截图；未框选时使用对应监控区域。",
+                  foreground="#555", wraplength=470).pack(anchor="w", pady=(2, 6))
+        buttons = ttk.Frame(parent)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="选择截图范围", command=self.select_region).pack(side="left")
+        ttk.Button(buttons, text="立即截图", command=self.capture_now).pack(side="left", padx=4)
+        ttk.Button(buttons, text="使用监控区域", command=self.clear_region).pack(side="left")
+        self.region_label = ttk.Label(parent, text="截图范围：使用触发监控的区域", wraplength=470)
+        self.region_label.pack(anchor="w", pady=5)
+        ttk.Button(parent, text="选择保存目录…", command=self.select_directory).pack(anchor="w")
+        self.directory_label = ttk.Label(parent, text=str(self.directory), wraplength=470)
+        self.directory_label.pack(anchor="w", pady=4)
+        self.status = tk.StringVar(value="截图就绪")
+        ttk.Label(parent, textvariable=self.status, wraplength=470).pack(anchor="w", pady=4)
+
+    def select_region(self) -> None:
+        RegionSelector(self.root, self._region_selected)
+
+    def _region_selected(self, region: Region) -> None:
+        self.region = region
+        self.region_label.configure(text=f"截图范围：({region.left}, {region.top})–"
+                                    f"({region.right}, {region.bottom})，{region.width}×{region.height}")
+
+    def clear_region(self) -> None:
+        self.region = None
+        self.region_label.configure(text="截图范围：使用触发监控的区域")
+
+    def set_directory(self, directory: Path) -> None:
+        self.directory = Path(directory)
+        self.directory_label.configure(text=str(self.directory))
+
+    def select_directory(self) -> None:
+        chosen = filedialog.askdirectory(title="选择截图保存目录", initialdir=str(self.directory))
+        if chosen:
+            self.set_directory(Path(chosen))
+
+    def capture_trigger(self, source: str, fallback_region: Region | None) -> Path:
+        region = self.region or fallback_region
+        try:
+            if region is None:
+                raise ValueError("请先选择截图范围。")
+            if ImageGrab is None:
+                raise RuntimeError("屏幕截图需要 Pillow，请重新运行 run.bat 安装依赖。")
+            image = ImageGrab.grab(bbox=(region.left, region.top, region.right, region.bottom))
+            path = save_monitor_screenshot(image, source, self.directory)
+        except Exception as exc:
+            self.status.set(f"截图保存失败：{exc}")
+            raise
+        self.status.set(f"已保存截图：{path}")
+        return path
+
+    def capture_now(self) -> None:
+        if self.region is None:
+            messagebox.showwarning("屏幕截图", "请先选择截图范围，再点击立即截图。")
+            return
+        try:
+            self.capture_trigger("manual", None)
+        except Exception as exc:
+            messagebox.showerror("截图失败", str(exc))
+
+
 class RedMonitorPanel:
     """Red-dot monitor embedded in the application's second tab."""
 
-    def __init__(self, parent: ttk.Frame, on_close_trigger=None) -> None:
+    def __init__(self, parent: ttk.Frame, on_close_trigger=None, on_before_close=None,
+                 on_state_change=None) -> None:
         self.parent = parent
         self.root = parent.winfo_toplevel()
         self.region: Region | None = None
@@ -1065,6 +1314,8 @@ class RedMonitorPanel:
         self.worker: threading.Thread | None = None
         self.running = False
         self.on_close_trigger = on_close_trigger or (lambda: None)
+        self.on_before_close = on_before_close
+        self.on_state_change = on_state_change or (lambda: None)
         self.sound_on_detection = tk.BooleanVar(value=True)
         self.settings = {
             # Include dim/anti-aliased edge pixels commonly found in small UI
@@ -1080,11 +1331,11 @@ class RedMonitorPanel:
         self._build_ui()
 
     def _build_ui(self) -> None:
-        ttk.Label(self.parent, text="红点监控", font=("Microsoft YaHei UI", 16, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(self.parent, text="红点监控", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(self.parent, text="检测提示音可选；触发关闭时停止全部任务并播放提示音。",
-                  foreground="#555").grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 14))
+                  foreground="#555", wraplength=470).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 5))
         ttk.Button(self.parent, text="选择监控区域", command=self.select_region).grid(row=2, column=0, sticky="w")
-        self.region_label = ttk.Label(self.parent, text="尚未选择区域")
+        self.region_label = ttk.Label(self.parent, text="尚未选择区域", wraplength=340)
         self.region_label.grid(row=2, column=1, columnspan=3, sticky="w", padx=8)
 
         fields = [
@@ -1098,22 +1349,22 @@ class RedMonitorPanel:
         for index, (label, key) in enumerate(fields):
             row, pair = 3 + index // 2, index % 2
             column = pair * 2
-            ttk.Label(self.parent, text=label).grid(row=row, column=column, sticky="w", pady=7)
-            ttk.Entry(self.parent, textvariable=self.settings[key], width=10).grid(row=row, column=column + 1, sticky="w")
+            ttk.Label(self.parent, text=label).grid(row=row, column=column, sticky="w", pady=2)
+            ttk.Entry(self.parent, textvariable=self.settings[key], width=7).grid(row=row, column=column + 1, sticky="w")
 
         ttk.Checkbutton(self.parent, text="检测到红点时播放提示音", variable=self.sound_on_detection).grid(
             row=9, column=0, columnspan=4, sticky="w", pady=(4, 0))
         buttons = ttk.Frame(self.parent)
-        buttons.grid(row=10, column=0, columnspan=4, sticky="w", pady=12)
+        buttons.grid(row=10, column=0, columnspan=4, sticky="w", pady=5)
         self.start_button = ttk.Button(buttons, text="开始监控", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止监控", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="状态：待机")
-        ttk.Label(self.parent, textvariable=self.status).grid(row=11, column=0, columnspan=4, sticky="w")
+        ttk.Label(self.parent, textvariable=self.status, wraplength=470).grid(row=11, column=0, columnspan=4, sticky="w")
         log_frame = ttk.LabelFrame(self.parent, text="运行日志", padding=6)
-        log_frame.grid(row=12, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
-        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
+        log_frame.grid(row=12, column=0, columnspan=4, sticky="nsew", pady=(4, 0))
+        self.log_text = tk.Text(log_frame, width=40, height=4, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True)
         for column in range(4):
             self.parent.columnconfigure(column, weight=1)
@@ -1127,6 +1378,7 @@ class RedMonitorPanel:
         text = f"({region.left}, {region.top})–({region.right}, {region.bottom})，{region.width}×{region.height}"
         self.region_label.configure(text=text)
         self._log(f"已选择监控区域：{text}")
+        getattr(self, "on_state_change", lambda: None)()
 
     def _validated_settings(self) -> dict[str, float | int]:
         values = {key: variable.get() for key, variable in self.settings.items()}
@@ -1143,21 +1395,22 @@ class RedMonitorPanel:
             raise ValueError("检测间隔至少为 20 ms，关闭等待时间不能小于 0 秒。")
         return values
 
-    def start(self) -> None:
+    def start(self) -> bool:
         if self.running:
-            return
+            return True
         if self.region is None:
             messagebox.showwarning("提示", "请先选择监控区域。")
-            return
+            return False
         if ImageGrab is None:
             messagebox.showerror("缺少依赖", "红点监控需要 Pillow，请重新运行 run.bat 安装依赖。")
-            return
+            return False
         try:
             settings = self._validated_settings()
         except (ValueError, tk.TclError) as exc:
             messagebox.showwarning("监控设置无效", str(exc))
-            return
+            return False
         self.running = True
+        self.active_region = self.region
         self.stop_event.clear()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -1165,6 +1418,8 @@ class RedMonitorPanel:
         self._log("开始监控")
         self.worker = threading.Thread(target=self._monitor, args=(self.region, settings), daemon=True)
         self.worker.start()
+        getattr(self, "on_state_change", lambda: None)()
+        return True
 
     def stop(self, silent: bool = False) -> None:
         if not self.running:
@@ -1176,6 +1431,7 @@ class RedMonitorPanel:
         self.status.set("状态：已停止")
         if not silent:
             self._log("停止监控")
+        getattr(self, "on_state_change", lambda: None)()
 
     def _monitor(self, region: Region, settings: dict[str, float | int]) -> None:
         detected_at: float | None = None
@@ -1202,15 +1458,7 @@ class RedMonitorPanel:
                     remaining = float(settings["close_delay"]) - (now - detected_at)
                     if remaining <= 0:
                         action_done = True
-                        screenshot_path: Path | None = None
-                        screenshot_error: Exception | None = None
-                        try:
-                            screenshot_path = save_red_detection_screenshot(image)
-                        except Exception as exc:
-                            screenshot_error = exc
-                        self.root.after(
-                            0, lambda path=screenshot_path, error=screenshot_error:
-                            self._close_foreground_window(path, error))
+                        self.root.after(0, self._close_foreground_window)
                         return
                     else:
                         self.root.after(0, lambda seconds=remaining: self.status.set(
@@ -1236,19 +1484,33 @@ class RedMonitorPanel:
                                  screenshot_error: Exception | None = None) -> None:
         if not self.running or self.stop_event.is_set():
             return
+        # Keep the target fixed while stopping tasks and saving the evidence.
+        close_error: Exception | None = None
+        hwnd = None
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if not hwnd:
+                raise RuntimeError("未找到前台窗口")
+        except Exception as exc:
+            close_error = exc
         # Run on Tk's main thread: stop_all also updates both monitor panels.
         self.on_close_trigger()
         self.stop(silent=True)
+        capture = getattr(self, "on_before_close", None)
+        if capture is not None and screenshot_path is None and screenshot_error is None:
+            try:
+                screenshot_path = capture("red_dot_detection", getattr(self, "active_region", None) or self.region)
+            except Exception as exc:
+                screenshot_error = exc
         play_notification_sound(self.root)
         if screenshot_path is not None:
             self._log(f"已停止全部监控和自动操作，并保存红点区域截图：{screenshot_path}")
         elif screenshot_error is not None:
             self._log(f"已停止全部监控和自动操作，但保存红点区域截图失败：{screenshot_error}")
         try:
-            import ctypes
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            if not hwnd:
-                raise RuntimeError("未找到前台窗口")
+            if close_error is not None:
+                raise close_error
             ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
             self.status.set("状态：红点持续存在，已发送关闭当前窗口指令")
             self._log("红点倒计时结束后仍存在，已关闭当前窗口")
@@ -1271,13 +1533,16 @@ class RedMonitorPanel:
 class YellowStabilityMonitorPanel:
     """Close the foreground window when a selected progress display stalls."""
 
-    def __init__(self, parent: ttk.Frame, on_close_trigger=None) -> None:
+    def __init__(self, parent: ttk.Frame, on_close_trigger=None, on_before_close=None,
+                 on_state_change=None) -> None:
         self.parent = parent
         self.root = parent.winfo_toplevel()
         self.region: Region | None = None
         self.running = False
         self.stop_event = threading.Event()
         self.on_close_trigger = on_close_trigger or (lambda: None)
+        self.on_before_close = on_before_close
+        self.on_state_change = on_state_change or (lambda: None)
         self.stall_seconds = tk.DoubleVar(value=10)
         self.check_interval = tk.IntVar(value=250)
         self.min_yellow_pixels = tk.IntVar(value=8)
@@ -1287,12 +1552,12 @@ class YellowStabilityMonitorPanel:
 
     def _build_ui(self) -> None:
         ttk.Label(self.parent, text="黄色进度条与数字监控",
-                  font=("Microsoft YaHei UI", 15, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+                  font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(self.parent,
                   text="框选同时包含黄色进度条和数字的区域；整个画面持续不变时关闭前台窗口。",
-                  foreground="#555").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 10))
+                  foreground="#555", wraplength=470).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 5))
         ttk.Button(self.parent, text="选择监控区域", command=self.select_region).grid(row=2, column=0, sticky="w")
-        self.region_label = ttk.Label(self.parent, text="尚未选择区域")
+        self.region_label = ttk.Label(self.parent, text="尚未选择区域", wraplength=340)
         self.region_label.grid(row=2, column=1, columnspan=3, sticky="w", padx=8)
         fields = [
             ("无变化秒数", self.stall_seconds), ("检测间隔 (ms)", self.check_interval),
@@ -1300,20 +1565,20 @@ class YellowStabilityMonitorPanel:
         ]
         for index, (label, variable) in enumerate(fields):
             row, pair = 3 + index // 2, index % 2
-            ttk.Label(self.parent, text=label).grid(row=row, column=pair * 2, sticky="w", pady=7)
-            ttk.Entry(self.parent, textvariable=variable, width=10).grid(row=row, column=pair * 2 + 1, sticky="w")
+            ttk.Label(self.parent, text=label).grid(row=row, column=pair * 2, sticky="w", pady=3)
+            ttk.Entry(self.parent, textvariable=variable, width=7).grid(row=row, column=pair * 2 + 1, sticky="w")
         ttk.Checkbutton(self.parent, text="已追踪的黄色进度条消失时立即关闭窗口",
                         variable=self.close_on_disappearance).grid(row=5, column=0, columnspan=4, sticky="w")
         buttons = ttk.Frame(self.parent)
-        buttons.grid(row=6, column=0, columnspan=4, sticky="w", pady=8)
+        buttons.grid(row=6, column=0, columnspan=4, sticky="w", pady=5)
         self.start_button = ttk.Button(buttons, text="开始监控", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止监控", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="状态：待机")
-        ttk.Label(self.parent, textvariable=self.status).grid(row=7, column=0, columnspan=4, sticky="w")
+        ttk.Label(self.parent, textvariable=self.status, wraplength=470).grid(row=7, column=0, columnspan=4, sticky="w")
         ttk.Label(self.parent, text="提示：区域尽量只包含进度条和数字；动态背景会被视为变化。",
-                  foreground="#666").grid(row=8, column=0, columnspan=4, sticky="w", pady=(10, 0))
+                  foreground="#666", wraplength=470).grid(row=8, column=0, columnspan=4, sticky="w", pady=(5, 0))
 
     def select_region(self) -> None:
         RegionSelector(self.root, self._region_selected)
@@ -1322,6 +1587,7 @@ class YellowStabilityMonitorPanel:
         self.region = region
         self.region_label.configure(
             text=f"({region.left}, {region.top})–({region.right}, {region.bottom})，{region.width}×{region.height}")
+        getattr(self, "on_state_change", lambda: None)()
 
     def _settings(self) -> tuple[float, int, int, float, bool]:
         values = (self.stall_seconds.get(), self.check_interval.get(),
@@ -1330,26 +1596,29 @@ class YellowStabilityMonitorPanel:
             raise ValueError("无变化秒数须大于 0，间隔至少 50 ms，黄色像素至少 1，容差须为 0–100%。")
         return values
 
-    def start(self) -> None:
+    def start(self) -> bool:
         if self.running:
-            return
+            return True
         if self.region is None:
             messagebox.showwarning("提示", "请先选择同时包含黄色进度条和数字的区域。")
-            return
+            return False
         if ImageGrab is None:
             messagebox.showerror("缺少依赖", "画面监控需要 Pillow，请重新运行 run.bat 安装依赖。")
-            return
+            return False
         try:
             settings = self._settings()
         except (ValueError, tk.TclError) as exc:
             messagebox.showwarning("监控设置无效", str(exc))
-            return
+            return False
         self.running = True
+        self.active_region = self.region
         self.stop_event.clear()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status.set("状态：正在等待黄色进度画面")
         threading.Thread(target=self._monitor, args=(self.region, settings), daemon=True).start()
+        getattr(self, "on_state_change", lambda: None)()
+        return True
 
     def stop(self, silent: bool = False) -> None:
         if not self.running:
@@ -1359,6 +1628,7 @@ class YellowStabilityMonitorPanel:
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.status.set("状态：已停止" if not silent else "状态：待机")
+        getattr(self, "on_state_change", lambda: None)()
 
     def _monitor(self, region: Region, settings: tuple[float, int, int, float, bool]) -> None:
         stall_seconds, interval, min_yellow, tolerance, close_on_disappearance = settings
@@ -1397,19 +1667,35 @@ class YellowStabilityMonitorPanel:
     def _close_foreground_window(self, disappeared: bool = False) -> None:
         if not self.running or self.stop_event.is_set():
             return
-        self.on_close_trigger()
-        self.stop(silent=True)
-        play_notification_sound(self.root)
+        close_error: Exception | None = None
+        hwnd = None
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetForegroundWindow()
             if not hwnd:
                 raise RuntimeError("未找到前台窗口")
+        except Exception as exc:
+            close_error = exc
+        self.on_close_trigger()
+        self.stop(silent=True)
+        screenshot_result = ""
+        capture = getattr(self, "on_before_close", None)
+        if capture is not None:
+            try:
+                path = capture("yellow_disappeared" if disappeared else "yellow_stall",
+                               getattr(self, "active_region", None) or self.region)
+                screenshot_result = f"；截图：{path}"
+            except Exception as exc:
+                screenshot_result = f"；截图保存失败：{exc}"
+        play_notification_sound(self.root)
+        try:
+            if close_error is not None:
+                raise close_error
             ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
-            self.status.set("状态：已追踪的黄色进度条消失，已发送关闭指令" if disappeared
-                            else "状态：黄色进度条和数字长时间未变化，已发送关闭指令")
+            self.status.set(("状态：已追踪的黄色进度条消失，已发送关闭指令" if disappeared
+                             else "状态：黄色进度条和数字长时间未变化，已发送关闭指令") + screenshot_result)
         except Exception as exc:  # pragma: no cover - depends on the Windows desktop
-            self.status.set(f"状态：关闭当前窗口失败：{exc}")
+            self.status.set(f"状态：关闭当前窗口失败：{exc}{screenshot_result}")
         finally:
             self.running = False
             self.stop_event.set()
